@@ -50,6 +50,10 @@ const {
   QUIDLI_API_KEY,
   BANKR_API_KEY,                 // Optional — owner's Bankr Agent API key; others link their own via bankr command               // Optional — if set, skips x402 payment
   DISCORD_ALLOWED_ROLES = '',   // Comma-separated role names allowed to use the bot
+  // Comma-separated server (guild) IDs the bot may stay in. Empty = any server.
+  // Set it before making the bot public: role checks match role NAMES, so any
+  // server could create a matching role. The bot leaves every other server.
+  DISCORD_ALLOWED_GUILDS = '',
   MASTER_ENCRYPTION_KEY,        // 64 hex chars (32 bytes) — used to encrypt stored API keys
   BOT_OWNER_ID,                 // Discord user ID of the bot owner — uses host QUIDLI_API_KEY for drops automatically
   BRAVE_SEARCH_API_KEY,         // Brave Search API key for web search tool
@@ -102,6 +106,17 @@ const ACTIVE_CHANNELS = new Set(
 const ALLOWED_USERS = new Set(
   DISCORD_ALLOWED_USERS.split(',').map((s) => s.trim()).filter(Boolean)
 );
+const ALLOWED_GUILDS = new Set(
+  DISCORD_ALLOWED_GUILDS.split(',').map((s) => s.trim()).filter(Boolean)
+);
+
+// Leave a server that is not on the allowlist. Empty allowlist = stay everywhere.
+async function leaveIfNotAllowed(guild) {
+  if (ALLOWED_GUILDS.size === 0 || ALLOWED_GUILDS.has(guild.id)) return false;
+  console.warn(`[guilds] leaving ${guild.name} (${guild.id}): not in DISCORD_ALLOWED_GUILDS`);
+  await guild.leave().catch((err) => console.error('[guilds] leave failed:', err?.message ?? err));
+  return true;
+}
 const ALLOWED_ROLES = new Set(
   DISCORD_ALLOWED_ROLES.split(',').map((s) => s.trim()).filter(Boolean)
 );
@@ -3055,8 +3070,9 @@ client.once(Events.ClientReady, (c) => {
   } else {
     console.log('   Mode: respond when @mentioned');
   }
-  // Store the first guild for role lookups
-  activeGuild = c.guilds.cache.first() ?? null;
+  // Leave servers that are not allowed, then store the first allowed guild for role lookups
+  for (const g of c.guilds.cache.values()) leaveIfNotAllowed(g);
+  activeGuild = c.guilds.cache.find((g) => ALLOWED_GUILDS.size === 0 || ALLOWED_GUILDS.has(g.id)) ?? null;
   if (activeGuild) console.log(`   Guild: ${activeGuild.name}`);
   // Re-queue any scheduled drops that survived a restart
   loadPendingDrops();
@@ -3110,6 +3126,8 @@ client.on(Events.MessageCreate, async (message) => {
 });
 
 // An 'error' event with no listener throws and takes the process down.
+client.on(Events.GuildCreate, (guild) => { leaveIfNotAllowed(guild); });
+
 client.on(Events.Error, (err) => console.error('[discord] client error:', err?.message ?? err));
 
 // Before this there were no signal handlers: pm2's SIGINT ended the process
