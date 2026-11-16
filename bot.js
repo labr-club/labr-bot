@@ -1363,6 +1363,35 @@ async function dropSource(input, apiKey, senderApiKey, senderUser) {
 
 const DROP_SHAPED = new Set(['connect_drop', 'schedule_drop', 'conditional_drop']);
 
+// "@Guillaume" typed as text is not a Discord mention: no ID comes with it, and
+// the model filled the gap with the only ID it had, the sender's. The bot looks
+// each plain-text @name up among the server's members and tells the model.
+async function resolvePlainNames(message) {
+  const text = String(message.content ?? '').replace(/<[@#][!&]?\d+>/g, ' ');
+  const botName = String(message.client?.user?.username ?? '').toLowerCase();
+  const names = [...new Set([...text.matchAll(/(?:^|[^\w@])@([\w.\-]{2,32})/g)].map((m) => m[1].replace(/[.\-]+$/, '')))]
+    .filter((n) => n.length > 1 && !['everyone', 'here'].includes(n.toLowerCase()) && n.toLowerCase() !== botName);
+  if (!names.length || !message.guild) return { users: [], note: '' };
+  try { await ensureMembersFetched(); } catch { return { users: [], note: '' }; }
+  const users = [];
+  const lines = [];
+  for (const n of names.slice(0, 10)) {
+    const q = n.toLowerCase();
+    const hits = message.guild.members.cache.filter((m) => !m.user.bot
+      && [m.user.username, m.user.globalName, m.displayName, m.nickname].filter(Boolean).some((x) => String(x).toLowerCase() === q));
+    if (hits.size === 1) {
+      const m = hits.first();
+      users.push({ id: m.id, username: m.user.username, globalName: m.user.globalName ?? null });
+      lines.push(`@${n} = Discord ID ${m.id} (username ${m.user.username}); pay them as {type:"discord", id:"${m.id}"}`);
+    } else if (hits.size > 1) {
+      lines.push(`@${n} matches ${hits.size} members (${[...hits.values()].slice(0, 5).map((m) => `${m.user.username} = ${m.id}`).join(', ')}); ask which one before sending`);
+    } else {
+      lines.push(`@${n}: no member of this server has that name. Never substitute another Discord user. Ask the user to pick them from the @ list, or which platform the handle is on`);
+    }
+  }
+  return { users, note: `\n[Plain-text @names, resolved by the bot: ${lines.join('; ')}]` };
+}
+
 // What in the send isn't in the sender's own message: recipients they never
 // named and an amount they never wrote. Empty = matches.
 function dropGroundCheck(input, userText, mentionedUsers = [], src = null) {
@@ -1533,8 +1562,13 @@ async function runTool(name, input, {
       heldNotices?.push(preSrc.problem);
       return JSON.stringify({ status: 'refused', executed: false, error: preSrc.problem + ' The bot already posted this; do not restate the wallet address.' });
     }
-    const missing = dropGroundCheck(input, userText, mentionedUsers, preSrc);
-    if (missing.length) { checkHold = 'ungrounded'; checkNotes.push(`-# Not in your message: ${missing.join(', ')}`); }
+    const myName = String(senderUser?.username ?? '').toLowerCase();
+    const isMe = (r) => r?.type === 'discord' && (String(r.id ?? '') === String(senderId) || (!!myName && String(r.username ?? '').replace(/^@/, '').toLowerCase() === myName));
+    const paysSelf = (input?.recipients ?? []).some(isMe) && !/\b(me|myself)\b/i.test(String(userText ?? ''));
+    if (paysSelf) { checkHold = 'self'; checkNotes.push(`-# ⚠️ This pays **you** (@${senderUser?.username ?? 'you'}), not someone you named. \`!cancel\` it and try again, picking the person from the @ list.`); }
+    const missing = dropGroundCheck({ ...input, recipients: (input?.recipients ?? []).filter((r) => !paysSelf || !isMe(r)) }, userText, mentionedUsers, preSrc)
+      .filter((m) => !(paysSelf && m === 'discord:' + senderId));
+    if (missing.length) { checkHold = checkHold ?? 'ungrounded'; checkNotes.push(`-# Not in your message: ${missing.join(', ')}`); }
     const cap = await capCheck(senderId, input, preSrc);
     preSrc.usd = cap.usd;
     if (cap.over) { checkHold = checkHold ?? 'cap'; checkNotes.push(`-# ${cap.over}`); }
@@ -2703,6 +2737,7 @@ async function handleMessage(message) {
       : '[User has NO personal Quidli API key — do NOT execute any drops. If they request a drop, tell them they must first DM me `!connect <your-api-key>` to link their Quidli account (get a key at connect.quid.li). Do not proceed with any token transfer.]';
   const now = new Date();
   const timeContext = `[Current date and time: ${now.toUTCString()} | Local ISO: ${now.toISOString()}]`;
+  const plainNames = await resolvePlainNames(message).catch(() => ({ users: [], note: '' }));
   // ── Documents ────────────────────────────────────────────────────────────────
   const docBlocks = [];
   for (const att of pdfAttachments) {
@@ -2731,7 +2766,7 @@ async function handleMessage(message) {
   const outcomeRecords = provider === 'minds' ? [] : heldOutcomeRecords.take(contextId);
   const contextualText =
     (outcomeRecords.length ? `${outcomeRecords.join('\n')}\n` : '') +
-    `${timeContext}\n[Sent by @${senderName} (Discord ID: ${message.author.id})] ${walletNote}\n`
+    `${timeContext}\n[Sent by @${senderName} (Discord ID: ${message.author.id})] ${walletNote}${plainNames.note}\n`
     + (replyContext ? `${replyContext}\n\n` : '')
     + neutraliseBotRecords(text)
     + (docBlocks.length ? `\n\n${docBlocks.join('\n\n')}` : '');
@@ -2750,7 +2785,7 @@ async function handleMessage(message) {
     senderApiKey,
     senderUser: message.author,
     userText: message.content,
-    mentionedUsers: [...(message.mentions?.users?.values?.() ?? [])].map((u) => ({ id: u.id, username: u.username, globalName: u.globalName ?? null })),
+    mentionedUsers: [...[...(message.mentions?.users?.values?.() ?? [])].map((u) => ({ id: u.id, username: u.username, globalName: u.globalName ?? null })), ...plainNames.users],
     currentChannelId: message.channelId,
     isPrivateChat: isDM,
     contextId,
@@ -2827,7 +2862,7 @@ async function handleMessage(message) {
             const pendingText = stripHtml(lastMindReply.messageText ?? '');
             if (age < 60 * 60 * 1000 && looksLikePendingAction(pendingText)) {
               handoffText =
-                `${timeContext}\n[Sent by @${senderName} (Discord ID: ${message.author.id})] ${walletNote}\n` +
+                `${timeContext}\n[Sent by @${senderName} (Discord ID: ${message.author.id})] ${walletNote}${plainNames.note}\n` +
                 `The user's Minds AI agent researched and prepared the following action plan. ` +
                 `The user has now confirmed it. Execute it immediately using your tools — no further confirmation needed:\n\n` +
                 `---\n${pendingText}\n---\n\n` +
