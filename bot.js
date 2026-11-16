@@ -1330,7 +1330,8 @@ async function dropSource(input, apiKey, senderApiKey, senderUser) {
   const addr = bal?.walletAddress;
   if (!addr) return { label: null, line: null, problem: null };
   const who = senderApiKey ? `@${senderUser?.username ?? 'your'}'s Connect wallet` : 'the Labr treasury';
-  const label = `${who} (\`${addr}\`) on ${chain}`;
+  const short = addr.length > 14 ? `${addr.slice(0, 6)}…${addr.slice(-4)}` : addr;
+  const label = `${who} (\`${short}\`) on ${chain}`;
   const assets = Array.isArray(bal.assets) ? bal.assets : [];
   const wanted = input?.tokenContract ? String(input.tokenContract).toLowerCase() : null;
   const token = wanted ? assets.find((a) => String(a.tokenContract ?? '').toLowerCase() === wanted) : assets.find((a) => a.type === 'native');
@@ -1339,9 +1340,10 @@ async function dropSource(input, apiKey, senderApiKey, senderUser) {
   const have = BigInt(token?.balanceInWei ?? 0);
   let need = null;
   try { need = BigInt(input?.amountInWeiPerRecipient ?? 0) * BigInt(Array.isArray(input?.recipients) ? input.recipients.length : 1); } catch {}
-  const line = `-# Paying from ${label} · balance ${formatUnits(have, decimals)} ${symbol}`;
+  // No balance here: these lines are posted in public channels.
+  const line = `-# Paying from ${label}`;
   const problem = need !== null && need > 0n && have < need
-    ? `⚠️ Not sent: ${who} on ${chain} has ${formatUnits(have, decimals)} ${symbol}, and this needs ${formatUnits(need, decimals)}. Wallet: \`${addr}\`` +
+    ? `⚠️ Not sent: ${who} on ${chain} doesn't have enough ${symbol} for this (needs ${formatUnits(need, decimals)}). Top up \`${addr}\` and try again.` +
       (senderApiKey ? '' : '\n-# No Connect key of yours is linked to Labr, so this would have paid from the treasury. DM me `!connect <your-key>` to pay from your own wallet.')
     : null;
   return { label, line, problem, chain, symbol, decimals, addr, who };
@@ -1473,7 +1475,8 @@ const WALLET_RULES = `
 ## Wallets: rules
 - Labr's Connect key belongs to the bot. Never ask anyone to link it, and never suggest it for their own sends. Everyone pays from their own Connect wallet, linked by DMing \`!connect <their-key>\`.
 - When someone asks for their wallet: connect_drop_balance's walletAddress is the wallet they pay FROM; connect_me's defaultEthWalletAddress / defaultSolanaWalletAddress is where they RECEIVE. Give both, labelled "sends from" and "receives at". If they have no key linked, say they need to DM \`!connect <key>\` first.
-- Never write a wallet address you did not get from a tool result or from the facts below.`;
+- Never write a wallet address you did not get from a tool result or from the facts below.
+- Never mention anyone's balance in a server channel unless they asked for their balance. Check it with tools as needed, but don't say it (no "You have ~5.8 USDC"). In a DM it's fine.`;
 function systemPrompt() {
   return SYSTEM_PROMPT + WALLET_RULES + walletFacts;
 }
