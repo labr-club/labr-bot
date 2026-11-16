@@ -1476,6 +1476,7 @@ const WALLET_RULES = `
 - Labr's Connect key belongs to the bot. Never ask anyone to link it, and never suggest it for their own sends. Everyone pays from their own Connect wallet, linked by DMing \`!connect <their-key>\`.
 - When someone asks for their wallet: connect_drop_balance's walletAddress is the wallet they pay FROM; connect_me's defaultEthWalletAddress / defaultSolanaWalletAddress is where they RECEIVE. Give both, labelled "sends from" and "receives at". If they have no key linked, say they need to DM \`!connect <key>\` first.
 - Never write a wallet address you did not get from a tool result or from the facts below.
+- Say "paid task", "reward" or "payout", never "bounty" or "airdrop".
 - Never mention anyone's balance in a server channel unless they asked for their balance. Check it with tools as needed, but don't say it (no "You have ~5.8 USDC"). In a DM it's fine.`;
 function systemPrompt() {
   return SYSTEM_PROMPT + WALLET_RULES + walletFacts;
@@ -1488,10 +1489,10 @@ async function loadWalletFacts(botUserId) {
   const look = await addr(async () => String(await mcpCallTool('connect_lookup', { recipients: [{ type: 'discord', id: String(botUserId) }] }, QUIDLI_API_KEY)));
   const evmR = look?.match(/0x[a-fA-F0-9]{40}/)?.[0] ?? null;
   const lines = [];
-  if (evmT || solT) lines.push(`- Your wallet is the Labr treasury. It funds bounties. ${[evmT && `Base/EVM: \`${evmT}\``, solT && `Solana: \`${solT}\``].filter(Boolean).join(' · ')}`);
+  if (evmT || solT) lines.push(`- Your wallet is the Labr treasury. It funds paid tasks. ${[evmT && `Base/EVM: \`${evmT}\``, solT && `Solana: \`${solT}\``].filter(Boolean).join(' · ')}`);
   if (evmR) lines.push(`- Internal, do not volunteer: your Discord account also resolves in Connect to \`${evmR}\`, which is receive-only and can never be spent. Mention it only if someone wants to send to @Labr by handle or asks about that address; then say funds sent there are stuck and give the treasury instead.`);
   if (!lines.length) return;
-  walletFacts = `\n\n## Your wallet (facts written by the bot from Connect)\n${lines.join('\n')}\nWhen asked for your wallet, answer in one short line: "My wallet is the Labr treasury, which funds bounties:" then the addresses. Nothing else unless asked.`;
+  walletFacts = `\n\n## Your wallet (facts written by the bot from Connect)\n${lines.join('\n')}\nWhen asked for your wallet, answer in one short line: "My wallet is the Labr treasury, which funds paid tasks:" then the addresses. Nothing else unless asked.`;
   console.log(`   Wallets: treasury ${evmT ?? '-'} / ${solT ?? '-'}, bot ID wallet ${evmR ?? '-'}`);
 }
 
