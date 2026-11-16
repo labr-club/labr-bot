@@ -1456,10 +1456,10 @@ async function loadWalletFacts(botUserId) {
   const look = await addr(async () => String(await mcpCallTool('connect_lookup', { recipients: [{ type: 'discord', id: String(botUserId) }] }, QUIDLI_API_KEY)));
   const evmR = look?.match(/0x[a-fA-F0-9]{40}/)?.[0] ?? null;
   const lines = [];
-  if (evmT || solT) lines.push(`- Labr treasury (the Labr Connect account, pays bounties through the payout flow only): ${[evmT && `EVM \`${evmT}\``, solT && `Solana \`${solT}\``].filter(Boolean).join(', ')}. Anyone can send to it to fund bounties.`);
-  if (evmR) lines.push(`- Labr's own Discord account wallet: EVM \`${evmR}\`. Receive-only: nobody can spend from it, so never tell anyone to send to @Labr. To fund Labr, send to the treasury.`);
+  if (evmT || solT) lines.push(`- Your wallet is the Labr treasury. It funds bounties. ${[evmT && `Base/EVM: \`${evmT}\``, solT && `Solana: \`${solT}\``].filter(Boolean).join(' · ')}`);
+  if (evmR) lines.push(`- Internal, do not volunteer: your Discord account also resolves in Connect to \`${evmR}\`, which is receive-only and can never be spent. Mention it only if someone wants to send to @Labr by handle or asks about that address; then say funds sent there are stuck and give the treasury instead.`);
   if (!lines.length) return;
-  walletFacts = `\n\n## Labr's wallets (facts written by the bot from Connect)\n${lines.join('\n')}\nWhen asked for Labr's wallet, give the treasury and explain the difference.`;
+  walletFacts = `\n\n## Your wallet (facts written by the bot from Connect)\n${lines.join('\n')}\nWhen asked for your wallet, answer in one short line: "My wallet is the Labr treasury, which funds bounties:" then the addresses. Nothing else unless asked.`;
   console.log(`   Wallets: treasury ${evmT ?? '-'} / ${solT ?? '-'}, bot ID wallet ${evmR ?? '-'}`);
 }
 
