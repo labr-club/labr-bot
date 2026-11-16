@@ -1436,6 +1436,33 @@ async function capCheck(senderId, input, src) {
   }
 }
 
+// The bot's own wallets, read from Connect at startup with the host key and
+// put in the system prompt as facts. Asked without them, the model said it had
+// no wallet, then told the owner to link the bot's key to their own account.
+let walletFacts = '';
+const WALLET_RULES = `
+## Wallets: rules
+- Labr's Connect key belongs to the bot. Never ask anyone to link it, and never suggest it for their own sends. Everyone pays from their own Connect wallet, linked by DMing \`!connect <their-key>\`.
+- When someone asks for their wallet: connect_drop_balance's walletAddress is the wallet they pay FROM; connect_me's defaultEthWalletAddress / defaultSolanaWalletAddress is where they RECEIVE. Give both, labelled "sends from" and "receives at". If they have no key linked, say they need to DM \`!connect <key>\` first.
+- Never write a wallet address you did not get from a tool result or from the facts below.`;
+function systemPrompt() {
+  return SYSTEM_PROMPT + WALLET_RULES + walletFacts;
+}
+async function loadWalletFacts(botUserId) {
+  if (!QUIDLI_API_KEY) return;
+  const addr = async (fn) => { try { return await fn(); } catch { return null; } };
+  const evmT = await addr(async () => JSON.parse(await mcpCallTool('connect_drop_balance', { chainId: 8453 }, QUIDLI_API_KEY))?.walletAddress);
+  const solT = await addr(async () => JSON.parse(await mcpCallTool('connect_drop_balance', { chainId: SOLANA_CHAIN_ID }, QUIDLI_API_KEY))?.walletAddress);
+  const look = await addr(async () => String(await mcpCallTool('connect_lookup', { recipients: [{ type: 'discord', id: String(botUserId) }] }, QUIDLI_API_KEY)));
+  const evmR = look?.match(/0x[a-fA-F0-9]{40}/)?.[0] ?? null;
+  const lines = [];
+  if (evmT || solT) lines.push(`- Labr treasury (the Labr Connect account, pays bounties through the payout flow only): ${[evmT && `EVM \`${evmT}\``, solT && `Solana \`${solT}\``].filter(Boolean).join(', ')}. Anyone can send to it to fund bounties.`);
+  if (evmR) lines.push(`- Labr's own Discord account wallet: EVM \`${evmR}\`. Receive-only: nobody can spend from it, so never tell anyone to send to @Labr. To fund Labr, send to the treasury.`);
+  if (!lines.length) return;
+  walletFacts = `\n\n## Labr's wallets (facts written by the bot from Connect)\n${lines.join('\n')}\nWhen asked for Labr's wallet, give the treasury and explain the difference.`;
+  console.log(`   Wallets: treasury ${evmT ?? '-'} / ${solT ?? '-'}, bot ID wallet ${evmR ?? '-'}`);
+}
+
 // Every Connect send is posted to #payouts so there is one public record.
 function postPayoutLog({ src, input, senderId, explorerUrl, transferHash }) {
   try {
@@ -2099,7 +2126,7 @@ async function runAnthropicLoop(contextId, contextualText, editor, toolCtx, user
     const response = await client.messages.create({
       model: modelUsed,
       max_tokens: 4096,
-      system: SYSTEM_PROMPT,
+      system: systemPrompt(),
       tools,
       messages,
     });
@@ -2155,7 +2182,7 @@ async function runGeminiLoop(contextId, contextualText, editor, toolCtx, userLlm
     }
     const response = await ai.models.generateContent({
       model: GEMINI_MODEL,
-      systemInstruction: SYSTEM_PROMPT,
+      systemInstruction: systemPrompt(),
       contents,
       tools: getGeminiTools(),
     });
@@ -2207,7 +2234,7 @@ async function runOpenAILoop(contextId, contextualText, editor, toolCtx, userLlm
 
   // Prepend system message each call (not stored in history)
   let messages = [
-    { role: 'system', content: SYSTEM_PROMPT },
+    { role: 'system', content: systemPrompt() },
     ...history,
   ];
   let accumulated = '';
@@ -2614,7 +2641,7 @@ async function handleMessage(message) {
   const senderApiKey = getUserApiKey(message.author.id);
   const walletNote = senderApiKey
     ? '[User has a personal Quidli API key connected — drops will use their Smart Send wallet]'
-    : isOwner
+    : isOwner && OWNER_HOST_KEY
       ? '[User is the bot owner — drops will use the host Smart Send wallet]'
       : '[User has NO personal Quidli API key — do NOT execute any drops. If they request a drop, tell them they must first DM me `!connect <your-api-key>` to link their Quidli account (get a key at connect.quid.li). Do not proceed with any token transfer.]';
   const now = new Date();
@@ -3219,6 +3246,7 @@ client.once(Events.ClientReady, (c) => {
   if (activeGuild) console.log(`   Guild: ${activeGuild.name}`);
   // Re-queue any scheduled drops that survived a restart
   loadPendingDrops();
+  loadWalletFacts(c.user.id).catch((err) => console.error('[wallets] load failed:', err.message));
   // Additive and non-blocking — a failure here leaves the hardcoded tools intact.
   registerMcpTools();
 });
