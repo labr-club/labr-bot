@@ -346,6 +346,7 @@ const HOLD_REASONS = {
   guard_replies: "you're replying to someone else's message, and you asked to confirm sends in that case",
   ungrounded: "it pays someone, or an amount, that isn't in your message",
   cap: "it's over the per-send or daily limit",
+  self: 'it pays you, not someone else',
 };
 
 /** Map a user's reply to a guard value, or null if it isn't one. */
