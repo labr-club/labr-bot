@@ -196,11 +196,23 @@ test('parseConfirmCommand', () => {
 const SRC = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'bot.js'), 'utf8');
 const runToolSrc = SRC.match(/^async function runTool[\s\S]*?\n}$/m)[0];
 
-function buildRunTool() {
+function buildRunTool(overrides = {}) {
   const calls = [];
+  const logs = [];   // #payouts receipts (Labr)
   const deps = {
     BOT_OWNER_ID: 'owner',
     QUIDLI_API_KEY: 'host-key',
+    // Labr: who pays, grounding and limits. Neutral here so the gate tests above
+    // see the same behaviour as upstream; the Labr tests below override them.
+    OWNER_HOST_KEY: 'host-key',
+    DROP_SHAPED: new Set(['connect_drop', 'schedule_drop', 'conditional_drop']),
+    isBotRecipient: () => false,
+    dropSource: async () => ({ label: 'test wallet on Base', line: '-# Paying from test wallet on Base', problem: null, chain: 'Base', symbol: 'USDC', decimals: 6, addr: '0xfeed', who: 'test wallet' }),
+    dropGroundCheck: () => [],
+    capCheck: async () => ({ usd: 1, over: null }),
+    recordSend: () => {},
+    postPayoutLog: (x) => logs.push({ senderId: x?.senderId, transferHash: x?.transferHash, via: x?.via ?? null }),
+    getUserBankrKey: () => null,
     MONEY_TOOLS,
     heldActions: createHeldActionStore(),
     describeHeldAction,
@@ -249,8 +261,9 @@ function buildRunTool() {
     getSendGuard: (id) => deps.guards[String(id)] ?? null,
     claimSendGuardQuestion: (id) => (deps.asked.has(String(id)) ? false : (deps.asked.add(String(id)), true)),
   };
+  Object.assign(deps, overrides);
   const runTool = new Function(...Object.keys(deps), `${runToolSrc}\nreturn runTool;`)(...Object.values(deps));
-  return { runTool, calls, deps };
+  return { runTool, calls, deps, logs };
 }
 
 const moneyInputs = {
@@ -267,8 +280,10 @@ for (const [tool, input] of Object.entries(moneyInputs)) {
     const out = JSON.parse(await runTool(tool, input, { senderId: 'u1', senderApiKey: 'k', documentInContext: true, heldNotices }));
     assert.equal(out.status, 'held_for_confirmation');
     assert.deepEqual(calls, [], 'nothing executed');
-    assert.equal(heldNotices.length, 1);
-    assert.match(heldNotices[0], new RegExp(`!confirm ${out.code}`));
+    const holdNotices = heldNotices.filter((n) => !n.startsWith('-# Paying from'));
+    assert.equal(holdNotices.length, 1);
+    assert.match(holdNotices[0], new RegExp(`!confirm ${out.code}`));
+    assert.equal(heldNotices.length, tool === 'connect_drop' ? 2 : 1, 'Labr: a held connect_drop also says which wallet would pay');
 
     await runTool(tool, input, { senderId: 'u1', senderApiKey: 'k', documentInContext: true, confirmed: true });
     assert.equal(calls.length, 1, 'confirmed call executes');
@@ -677,7 +692,7 @@ test('guard replies: a replying turn is held, a plain one sends', async () => {
   const out = JSON.parse(await runTool('connect_drop', drop, { senderId: 'u1', senderApiKey: 'k', quotesOther: true, heldNotices: notices }));
   assert.equal(out.status, 'held_for_confirmation');
   assert.equal(calls.length, 0);
-  assert.match(notices[0], /replying to someone else/);
+  assert.match(notices.join('\n'), /replying to someone else/);
   await runTool('connect_drop', drop, { senderId: 'u1', senderApiKey: 'k' });
   assert.equal(calls.length, 1);
 });
@@ -698,7 +713,8 @@ test('never chose: asked once on the first send, which still runs', async () => 
   await runTool('connect_drop', drop, { senderId: 'u1', senderApiKey: 'k', heldNotices: n2 });
   assert.equal(calls.length, 2);
   assert.match(n1.join('\n'), /!guard replies/);
-  assert.equal(n2.length, 0);
+  assert.doesNotMatch(n2.join('\n'), /!guard/, 'the question is asked once');
+  assert.deepEqual(n2, ['-# Paid from test wallet on Base'], 'Labr: each send says which wallet paid');
 });
 
 test('a document still holds when the user chose none', async () => {
@@ -787,4 +803,57 @@ test('a balance is carried to the next turn in private only', async () => {
   assert.match(d.heldOutcomeRecords.take('dm')[0], /connect_drop_balance for chain 5042 returned USDC 5/);
   await rt('connect_drop_balance', { chainId: 5042 }, { senderId: 'u1', senderApiKey: 'k', contextId: 'grp', isPrivateChat: false });
   assert.equal(d.heldOutcomeRecords.take('grp').length, 0);
+});
+
+
+// ─── Labr: who pays, grounding, limits, receipts ─────────────────────────────
+
+test('Labr: a completed connect_drop posts one receipt to #payouts and says which wallet paid', async () => {
+  const { runTool, calls, logs } = buildRunTool();
+  const notices = [];
+  const out = JSON.parse(await runTool('connect_drop', drop, { senderId: 'u1', senderApiKey: 'k', heldNotices: notices }));
+  assert.equal(out.transferHash, '0xabc');
+  assert.equal(out.paidFrom, 'test wallet on Base');
+  assert.deepEqual(calls, [{ tool: 'connect_drop', key: 'k' }]);
+  assert.deepEqual(logs, [{ senderId: 'u1', transferHash: '0xabc', via: null }]);
+  assert.ok(notices.includes('-# Paid from test wallet on Base'));
+});
+
+test('Labr: a send to the bot itself is refused before anything runs', async () => {
+  const { runTool, calls, logs } = buildRunTool({ isBotRecipient: () => true });
+  const out = JSON.parse(await runTool('connect_drop', drop, { senderId: 'u1', senderApiKey: 'k' }));
+  assert.equal(out.status, 'refused');
+  assert.equal(out.executed, false);
+  assert.deepEqual(calls, []);
+  assert.deepEqual(logs, []);
+});
+
+test('Labr: a recipient or amount that is not in the sender\'s message waits for !confirm', async () => {
+  const { runTool, calls, logs } = buildRunTool({ dropGroundCheck: () => ['discord:999'] });
+  const notices = [];
+  const out = JSON.parse(await runTool('connect_drop', drop, { senderId: 'u1', senderApiKey: 'k', heldNotices: notices }));
+  assert.equal(out.status, 'held_for_confirmation');
+  assert.deepEqual(calls, []);
+  assert.deepEqual(logs, [], 'no receipt for a send that has not happened');
+  assert.match(notices.join('\n'), /Not in your message: discord:999/);
+});
+
+test('Labr: a send over the limit waits for !confirm', async () => {
+  const { runTool, calls } = buildRunTool({ capCheck: async () => ({ usd: 75, over: 'This send is about $75.00, over the $50.00 per-send limit.' }) });
+  const notices = [];
+  const out = JSON.parse(await runTool('connect_drop', drop, { senderId: 'u1', senderApiKey: 'k', heldNotices: notices }));
+  assert.equal(out.status, 'held_for_confirmation');
+  assert.deepEqual(calls, []);
+  assert.match(notices.join('\n'), /over the \$50\.00 per-send limit/);
+});
+
+test('Labr: a wallet that cannot cover the send is refused with the bot-written reason', async () => {
+  const problem = '⚠️ Not sent: not enough USDC.';
+  const { runTool, calls, logs } = buildRunTool({ dropSource: async () => ({ label: 'w', line: '-# Paying from w', problem }) });
+  const notices = [];
+  const out = JSON.parse(await runTool('connect_drop', drop, { senderId: 'u1', senderApiKey: 'k', heldNotices: notices }));
+  assert.equal(out.status, 'refused');
+  assert.deepEqual(calls, []);
+  assert.deepEqual(logs, []);
+  assert.deepEqual(notices, [problem]);
 });

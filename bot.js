@@ -32,7 +32,7 @@ import { resolveRecipientsToWallets } from './recipients.js';
 import { payoutProposal, payoutExecute, summariseRound, groundCheck, roundHash } from './payout-proposal.js';
 import { createWorldGate, loadWorldConfig } from './world-id.js';
 import { createPayoutApprover, formatPayoutResult } from './payout-approval.js';
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, readFileSync } from 'node:fs';
 import { createMcpRegistry, MCP_CONFIRM_TOOLS, formatToolRecord } from './connect-mcp.js';
 import { createShutdown } from './shutdown.js';
 import { createSecretBox } from './secrets.js';
@@ -45,7 +45,9 @@ const {
   CLAUDE_MODEL = 'claude-sonnet-4-6',
   DISCORD_ACTIVE_CHANNELS = '',
   DISCORD_ALLOWED_USERS = '',
-  SYSTEM_PROMPT: SYSTEM_PROMPT_OVERRIDE,
+  SYSTEM_PROMPT: SYSTEM_PROMPT_ENV,
+  // Path to a prompt file, relative to the bot's directory. Wins over SYSTEM_PROMPT.
+  SYSTEM_PROMPT_FILE,
   BOT_WALLET_ADDRESS,
   QUIDLI_API_KEY,
   BANKR_API_KEY,                 // Optional — owner's Bankr Agent API key; others link their own via bankr command               // Optional — if set, skips x402 payment
@@ -153,6 +155,21 @@ const EDIT_THROTTLE_MS = 750;
 const QUIDLI_BASE_URL = 'https://api.connect.quid.li';
 
 // ─── System prompt ────────────────────────────────────────────────────────────
+
+function readPromptFile(path) {
+  if (!path) return null;
+  try {
+    const text = readFileSync(new URL(path, import.meta.url), 'utf8').trim();
+    if (text) return text;
+    console.error(`[prompt] ${path} is empty; falling back`);
+  } catch (err) {
+    console.error(`[prompt] could not read ${path}: ${err.message}; falling back`);
+  }
+  return null;
+}
+const SYSTEM_PROMPT_FROM_FILE = readPromptFile(SYSTEM_PROMPT_FILE);
+const SYSTEM_PROMPT_OVERRIDE = SYSTEM_PROMPT_FROM_FILE || SYSTEM_PROMPT_ENV;
+const PROMPT_SOURCE = SYSTEM_PROMPT_FROM_FILE ? `file ${SYSTEM_PROMPT_FILE}` : SYSTEM_PROMPT_ENV ? 'SYSTEM_PROMPT in .env' : 'built-in';
 
 const SYSTEM_PROMPT = SYSTEM_PROMPT_OVERRIDE || `
 You are DiscoCentaur, a Discord bot that sends crypto tokens to people using Quidli Connect. Your job is to EXECUTE — not explain, not ask for confirmation, not hedge. When someone asks you to do something, do it.
@@ -519,6 +536,7 @@ async function executeScheduledDrop(jobId) {
     }
 
     const result = await quidliDrop(dropInput, keyToUse);
+    const paidFrom = await logAutoSend({ input: dropInput, keyToUse, senderId: job.sender_id, result, via: 'scheduled' });
 
     // DM the sender
     const user = await client.users.fetch(job.sender_id).catch(() => null);
@@ -527,7 +545,7 @@ async function executeScheduledDrop(jobId) {
       await user.send(
         `✅ Your scheduled drop executed!\n` +
         `Sent to ${recipientCount} recipient${recipientCount !== 1 ? 's' : ''}.\n` +
-        (result.explorerUrl ? `Transaction: ${result.explorerUrl}` : '')
+        (result.explorerUrl ? `Transaction: ${result.explorerUrl}` : '') + paidFrom
       ).catch(() => {});
     }
     // DM each Discord recipient
@@ -685,13 +703,14 @@ async function executeConditionalDrop(jobId) {
     }
 
     const result = await quidliDrop(resolvedDrop, keyToUse);
+    const paidFrom = await logAutoSend({ input: resolvedDrop, keyToUse, senderId: job.sender_id, result, via: 'conditional' });
 
     if (senderUser) {
       const recipientCount = resolvedDrop.recipients?.length ?? 1;
       await senderUser.send(
         `✅ Condition met: "${condition}"\n` +
         `Drop executed to ${recipientCount} recipient${recipientCount !== 1 ? 's' : ''}.\n` +
-        (result.explorerUrl ? `Transaction: ${result.explorerUrl}` : '')
+        (result.explorerUrl ? `Transaction: ${result.explorerUrl}` : '') + paidFrom
       ).catch(() => {});
     }
 
@@ -1316,7 +1335,21 @@ function sanitizeUnverifiedTxClaims(text, realUrls) {
 // The wallet that pays is decided by the key, and the bot writes it out itself.
 // A model left to describe it named the wrong wallet and invented an address.
 const SOLANA_CHAIN_ID = 1399811149;
-const CHAIN_NAMES = { 8453: 'Base', 1: 'Ethereum', 10: 'Optimism', 42161: 'Arbitrum', 137: 'Polygon', 143: 'Monad', 480: 'World Chain', 4663: 'Robinhood Chain', [SOLANA_CHAIN_ID]: 'Solana' };
+// Fallback names only. loadChainNames() replaces them with Connect's own list
+// at startup, so a chain Connect adds later (Arc was missing here once) is
+// named correctly in "Paying from" lines and #payouts without a code change.
+const CHAIN_NAMES = { 8453: 'Base', 1: 'Ethereum', 10: 'Optimism', 42161: 'Arbitrum', 137: 'Polygon', 43114: 'Avalanche', 143: 'Monad', 480: 'World Chain', 5042: 'Arc', 4663: 'Robinhood Chain', [SOLANA_CHAIN_ID]: 'Solana' };
+
+async function loadChainNames() {
+  const out = JSON.parse(await mcpCallTool('connect_get_chains', {}, QUIDLI_API_KEY));
+  let n = 0;
+  for (const c of Array.isArray(out?.chains) ? out.chains : []) {
+    if (c?.chainId == null || !c?.name || c.isTestnet) continue;
+    CHAIN_NAMES[Number(c.chainId)] = String(c.name);
+    n++;
+  }
+  console.log(`   Chains: ${n} from Connect`);
+}
 
 function isBotRecipient(r, botId) {
   if (!r || r.type !== 'discord') return false;
@@ -1511,19 +1544,40 @@ async function loadWalletFacts(botUserId) {
 }
 
 // Every Connect send is posted to #payouts so there is one public record.
-function postPayoutLog({ src, input, senderId, explorerUrl, transferHash }) {
+function postPayoutLog({ src, input, senderId, explorerUrl, transferHash, via = null }) {
   try {
     const ch = activeGuild?.channels?.cache?.find((c) => c.name === 'payouts' && c.isTextBased?.());
     if (!ch) return;
     const rs = (input?.recipients ?? []).map((r) => r.type === 'discord' && r.id ? `<@${r.id}>` : `${r.type}:${r.username ?? r.id}`);
     let each = '';
-    try { each = `${formatUnits(BigInt(input.amountInWeiPerRecipient), src.decimals)} ${src.symbol}`; } catch {}
+    try { if (src?.decimals != null && src?.symbol) each = `${formatUnits(BigInt(input.amountInWeiPerRecipient), src.decimals)} ${src.symbol}`; } catch {}
+    const chain = src?.chain ?? CHAIN_NAMES[Number(input?.chainId ?? 8453)] ?? `chain ${input?.chainId}`;
+    const from = src?.who && src?.addr ? `\n-# from ${src.who} \`${src.addr}\`` : '';
     ch.send({
-      content: `💸 <@${senderId}> paid ${rs.join(', ') || 'someone'}${each ? ` ${each}${rs.length > 1 ? ' each' : ''}` : ''} on ${src.chain}\n-# from ${src.who} \`${src.addr}\`\n${explorerUrl ?? `tx \`${transferHash}\``}`,
+      content: `💸 <@${senderId}> paid ${rs.join(', ') || 'someone'}${each ? ` ${each}${rs.length > 1 ? ' each' : ''}` : ''} on ${chain}${via ? ` (${via})` : ''}${from}\n${explorerUrl ?? `tx \`${transferHash}\``}`,
       allowedMentions: { parse: [] },
     }).catch((err) => console.error('[payouts] post failed:', err.message));
   } catch (err) {
     console.error('[payouts] post failed:', err.message);
+  }
+}
+
+// Scheduled, conditional and watcher sends run later, outside runTool, so they
+// post their own receipt here. Returns the "Paid from" line for the sender's DM.
+// Never throws: the money has already moved, and a failed receipt must not turn
+// a sent payout into a reported failure.
+async function logAutoSend({ input, keyToUse, senderId, result, via }) {
+  if (!result?.transferHash) return '';
+  try {
+    const senderApiKey = getUserApiKey(senderId);
+    const senderUser = await client.users.fetch(senderId).catch(() => null);
+    let src = await dropSource(input, keyToUse, senderApiKey, senderUser);
+    if (!src?.label) src = null;
+    postPayoutLog({ src, input, senderId, explorerUrl: result.explorerUrl, transferHash: result.transferHash, via });
+    return src?.label ? `\n-# Paid from: ${src.label}` : '';
+  } catch (err) {
+    console.error('[payouts] auto-send receipt failed:', err.message);
+    return '';
   }
 }
 
@@ -3294,9 +3348,10 @@ async function checkWatchers(message) {
       const result = await quidliDrop(dropInput, keyToUse);
       if (result.transferHash) {
         const url = result.explorerUrl;
+        const paidFrom = await logAutoSend({ input: dropInput, keyToUse, senderId: watcher.sender_id, result, via: 'watcher' });
         message.author.send(`🎉 You triggered the drop by typing "${watcher.trigger_phrase}"! Tokens are on the way.\nTransaction: ${url}`).catch(() => {});
         const sender = await client.users.fetch(watcher.sender_id).catch(() => null);
-        if (sender) sender.send(`✅ Watcher triggered! ${message.author.username} typed "${watcher.trigger_phrase}".\nTransaction: ${url}`).catch(() => {});
+        if (sender) sender.send(`✅ Watcher triggered! ${message.author.username} typed "${watcher.trigger_phrase}".\nTransaction: ${url}${paidFrom}`).catch(() => {});
       }
       console.log(`[watcher] ${watcher.id} fired for ${message.author.username}`);
     } catch (err) {
@@ -3325,6 +3380,7 @@ client.once(Events.ClientReady, (c) => {
     : CLAUDE_MODEL;
   console.log(`✅ Claudetaur ready — logged in as ${c.user.tag}`);
   console.log(`   Default LLM: ${DEFAULT_LLM_PROVIDER} (${defaultModel})`);
+  console.log(`   Prompt: ${PROMPT_SOURCE}`);
   if (GEMINI_API_KEY) console.log(`   Gemini: ${GEMINI_MODEL} ✓`);
   if (OPENAI_API_KEY) console.log(`   OpenAI: ${OPENAI_MODEL} ✓`);
   if (NOUS_API_KEY) console.log(`   Hermes: ${NOUS_MODEL} ✓ (via Nous Portal — 200+ models, per-user override with !llm hermes <key> <model>)`);
@@ -3344,6 +3400,7 @@ client.once(Events.ClientReady, (c) => {
   // Re-queue any scheduled drops that survived a restart
   loadPendingDrops();
   loadWalletFacts(c.user.id).catch((err) => console.error('[wallets] load failed:', err.message));
+  loadChainNames().catch((err) => console.error('[chains] load failed, using the built-in names:', err.message));
   // Additive and non-blocking — a failure here leaves the hardcoded tools intact.
   registerMcpTools();
 });
