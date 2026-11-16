@@ -51,6 +51,9 @@ const {
   // Set it before making the bot public: role checks match role NAMES, so any
   // server could create a matching role. The bot leaves every other server.
   DISCORD_ALLOWED_GUILDS = '',
+  // 'false' = the owner pays from their own linked key like everyone else, and
+  // the host QUIDLI_API_KEY never pays for a send. Default keeps the old fallback.
+  OWNER_USES_HOST_KEY = 'true',
   MASTER_ENCRYPTION_KEY,        // 64 hex chars (32 bytes) — used to encrypt stored API keys
   BOT_OWNER_ID,                 // Discord user ID of the bot owner — uses host QUIDLI_API_KEY for drops automatically
   BRAVE_SEARCH_API_KEY,         // Brave Search API key for web search tool
@@ -103,6 +106,7 @@ const ACTIVE_CHANNELS = new Set(
 const ALLOWED_USERS = new Set(
   DISCORD_ALLOWED_USERS.split(',').map((s) => s.trim()).filter(Boolean)
 );
+const OWNER_HOST_KEY = OWNER_USES_HOST_KEY === 'false' ? null : QUIDLI_API_KEY;
 const ALLOWED_GUILDS = new Set(
   DISCORD_ALLOWED_GUILDS.split(',').map((s) => s.trim()).filter(Boolean)
 );
@@ -494,7 +498,7 @@ async function executeScheduledDrop(jobId) {
   const stored = JSON.parse(job.drop_input);
   const isOwner = BOT_OWNER_ID && job.sender_id === BOT_OWNER_ID;
   const senderApiKey = getUserApiKey(job.sender_id);
-  const keyToUse = senderApiKey || (isOwner ? QUIDLI_API_KEY : null);
+  const keyToUse = senderApiKey || (isOwner ? OWNER_HOST_KEY : null);
 
   try {
     if (!keyToUse) throw new Error('No API key available — sender may have revoked their key.');
@@ -669,7 +673,7 @@ async function executeConditionalDrop(jobId) {
     // Condition met — execute the drop
     const isOwner = BOT_OWNER_ID && job.sender_id === BOT_OWNER_ID;
     const senderApiKey = getUserApiKey(job.sender_id);
-    const keyToUse = senderApiKey || (isOwner ? QUIDLI_API_KEY : null);
+    const keyToUse = senderApiKey || (isOwner ? OWNER_HOST_KEY : null);
     if (!keyToUse) throw new Error('No API key available — sender may have revoked their key.');
 
     let resolvedDrop = { ...dropParams };
@@ -1294,6 +1298,161 @@ function sanitizeUnverifiedTxClaims(text, realUrls) {
   });
 }
 
+// ─── Who pays (Labr) ─────────────────────────────────────────────────────────
+// The wallet that pays is decided by the key, and the bot writes it out itself.
+// A model left to describe it named the wrong wallet and invented an address.
+const SOLANA_CHAIN_ID = 1399811149;
+const CHAIN_NAMES = { 8453: 'Base', 1: 'Ethereum', 10: 'Optimism', 42161: 'Arbitrum', 137: 'Polygon', 143: 'Monad', 480: 'World Chain', 4663: 'Robinhood Chain', [SOLANA_CHAIN_ID]: 'Solana' };
+
+function isBotRecipient(r, botId) {
+  if (!r || r.type !== 'discord') return false;
+  const me = client.user;
+  if (r.id && (String(r.id) === String(botId ?? me?.id))) return true;
+  const u = String(r.username ?? '').replace(/^@/, '').toLowerCase();
+  return !!u && !!me && (u === me.username.toLowerCase() || u === String(me.tag ?? '').toLowerCase());
+}
+
+function formatUnits(wei, decimals) {
+  const d = BigInt(decimals);
+  const base = 10n ** d;
+  const whole = wei / base;
+  let frac = (wei % base).toString().padStart(Number(d), '0').replace(/0+$/, '').slice(0, 6);
+  return frac ? `${whole}.${frac}` : `${whole}`;
+}
+
+// Returns { label, line, problem }. Never throws: a balance read that fails
+// leaves the send to Connect, which refuses it itself if the money isn't there.
+async function dropSource(input, apiKey, senderApiKey, senderUser) {
+  const chainId = Number(input?.chainId ?? 8453);
+  const chain = CHAIN_NAMES[chainId] ?? `chain ${chainId}`;
+  let bal;
+  try { bal = JSON.parse(await mcpCallTool('connect_drop_balance', { chainId }, apiKey)); } catch { return { label: null, line: null, problem: null }; }
+  const addr = bal?.walletAddress;
+  if (!addr) return { label: null, line: null, problem: null };
+  const who = senderApiKey ? `@${senderUser?.username ?? 'your'}'s Connect wallet` : 'the Labr treasury';
+  const label = `${who} (\`${addr}\`) on ${chain}`;
+  const assets = Array.isArray(bal.assets) ? bal.assets : [];
+  const wanted = input?.tokenContract ? String(input.tokenContract).toLowerCase() : null;
+  const token = wanted ? assets.find((a) => String(a.tokenContract ?? '').toLowerCase() === wanted) : assets.find((a) => a.type === 'native');
+  const decimals = Number(token?.decimals ?? (chainId === SOLANA_CHAIN_ID ? 9 : 18));
+  const symbol = token?.symbol ?? (wanted ? 'of that token' : (chainId === SOLANA_CHAIN_ID ? 'SOL' : 'ETH'));
+  const have = BigInt(token?.balanceInWei ?? 0);
+  let need = null;
+  try { need = BigInt(input?.amountInWeiPerRecipient ?? 0) * BigInt(Array.isArray(input?.recipients) ? input.recipients.length : 1); } catch {}
+  const line = `-# Paying from ${label} · balance ${formatUnits(have, decimals)} ${symbol}`;
+  const problem = need !== null && need > 0n && have < need
+    ? `⚠️ Not sent: ${who} on ${chain} has ${formatUnits(have, decimals)} ${symbol}, and this needs ${formatUnits(need, decimals)}. Wallet: \`${addr}\`` +
+      (senderApiKey ? '' : '\n-# No Connect key of yours is linked to Labr, so this would have paid from the treasury. DM me `!connect <your-key>` to pay from your own wallet.')
+    : null;
+  return { label, line, problem, chain, symbol, decimals, addr, who };
+}
+
+const DROP_SHAPED = new Set(['connect_drop', 'schedule_drop', 'conditional_drop']);
+
+// What in the send isn't in the sender's own message: recipients they never
+// named and an amount they never wrote. Empty = matches.
+function dropGroundCheck(input, userText, mentionedUsers = [], src = null) {
+  const text = String(userText ?? '');
+  const low = text.toLowerCase();
+  const missing = [];
+  const recipients = Array.isArray(input?.recipients) ? input.recipients : [];
+  for (const r of recipients) {
+    const vals = [r?.id, r?.username].filter(Boolean).map((v) => String(v).replace(/^@/, '').toLowerCase());
+    let ok = vals.some((v) => v.length > 1 && low.includes(v));
+    if (!ok && r?.type === 'discord') {
+      ok = mentionedUsers.some((u) => vals.includes(String(u.id)) || vals.includes(String(u.username ?? '').toLowerCase()) || vals.includes(String(u.globalName ?? '').toLowerCase()));
+    }
+    if (!ok) missing.push(`${r?.type ?? '?'}:${r?.username ?? r?.id ?? '?'}`);
+  }
+  if (src?.decimals != null && input?.amountInWeiPerRecipient != null) {
+    try {
+      const perWei = BigInt(input.amountInWeiPerRecipient);
+      const per = Number(formatUnits(perWei, src.decimals));
+      const total = per * Math.max(1, recipients.length);
+      const nums = (text.replace(/<[@#][!&]?\d+>/g, ' ').match(/\d[\d,]*(?:\.\d+)?|\.\d+/g) ?? []).map((x) => Number(x.replace(/,/g, '')));
+      const near = (a, b) => Math.abs(a - b) <= 1e-9 * Math.max(1, Math.abs(b));
+      if (!nums.some((v) => near(v, per) || near(v, total))) missing.push(`amount ${formatUnits(perWei, src.decimals)} ${src.symbol ?? ''}`.trim());
+    } catch {}
+  }
+  return missing;
+}
+
+// Limits, in USD. 0 turns one off. Over a limit the send waits for !confirm;
+// it is never refused, so a deliberate large send still goes through.
+const MAX_SEND_USD = Number(process.env.MAX_SEND_USD ?? 50);
+const DAILY_SEND_USD = Number(process.env.DAILY_SEND_USD ?? 200);
+db.exec(`CREATE TABLE IF NOT EXISTS send_log (sender_id TEXT NOT NULL, usd REAL NOT NULL, at INTEGER NOT NULL DEFAULT (unixepoch()))`);
+const STABLE_RE = /^(USDC|USDT|DAI|USDS|USDBC|PYUSD|USDE|EURC)$/i;
+const NATIVE_PRICE_TOKEN = {
+  8453: '0x4200000000000000000000000000000000000006', 10: '0x4200000000000000000000000000000000000006',
+  1: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2', 42161: '0x82aF49447D8a07e3bd95BD0d56f35241523fBab1',
+  [SOLANA_CHAIN_ID]: 'So11111111111111111111111111111111111111112',
+};
+const priceCache = new Map();
+async function tokenUsd(chainId, tokenContract, symbol) {
+  if (STABLE_RE.test(String(symbol ?? ''))) return 1;
+  const addr = String(tokenContract || NATIVE_PRICE_TOKEN[chainId] || '');
+  if (!addr) return null;
+  const hit = priceCache.get(addr.toLowerCase());
+  if (hit && Date.now() - hit.at < 5 * 60 * 1000) return hit.usd;
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 5000);
+  try {
+    const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${addr}`, { signal: ac.signal });
+    if (!res.ok) return null;
+    const pairs = ((await res.json())?.pairs ?? []).filter((p) => String(p?.baseToken?.address ?? '').toLowerCase() === addr.toLowerCase() && Number(p?.priceUsd) > 0);
+    if (!pairs.length) return null;
+    pairs.sort((a, b) => Number(b?.liquidity?.usd ?? 0) - Number(a?.liquidity?.usd ?? 0));
+    const usd = Number(pairs[0].priceUsd);
+    priceCache.set(addr.toLowerCase(), { usd, at: Date.now() });
+    return usd;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+function usdSentToday(senderId) {
+  return db.prepare('SELECT COALESCE(SUM(usd), 0) AS t FROM send_log WHERE sender_id = ? AND at > unixepoch() - 86400').get(String(senderId))?.t ?? 0;
+}
+function recordSend(senderId, usd) {
+  if (usd > 0) db.prepare('INSERT INTO send_log (sender_id, usd) VALUES (?, ?)').run(String(senderId), usd);
+}
+// Returns { usd, over }. usd is null when the token has no price; then no
+// limit applies, because a guess would either block or wave through at random.
+async function capCheck(senderId, input, src) {
+  try {
+    const price = await tokenUsd(Number(input?.chainId ?? 8453), input?.tokenContract, src?.symbol);
+    if (price == null || src?.decimals == null) return { usd: null, over: null };
+    const n = Math.max(1, Array.isArray(input?.recipients) ? input.recipients.length : 1);
+    const usd = Number(formatUnits(BigInt(input.amountInWeiPerRecipient) * BigInt(n), src.decimals)) * price;
+    const today = usdSentToday(senderId);
+    const r = (x) => `$${x.toFixed(2)}`;
+    if (MAX_SEND_USD > 0 && usd > MAX_SEND_USD) return { usd, over: `This send is about ${r(usd)}, over the ${r(MAX_SEND_USD)} per-send limit.` };
+    if (DAILY_SEND_USD > 0 && today + usd > DAILY_SEND_USD) return { usd, over: `This send (about ${r(usd)}) takes you past the ${r(DAILY_SEND_USD)} daily limit (${r(today)} sent in the last 24h).` };
+    return { usd, over: null };
+  } catch {
+    return { usd: null, over: null };
+  }
+}
+
+// Every Connect send is posted to #payouts so there is one public record.
+function postPayoutLog({ src, input, senderId, explorerUrl, transferHash }) {
+  try {
+    const ch = activeGuild?.channels?.cache?.find((c) => c.name === 'payouts' && c.isTextBased?.());
+    if (!ch) return;
+    const rs = (input?.recipients ?? []).map((r) => r.type === 'discord' && r.id ? `<@${r.id}>` : `${r.type}:${r.username ?? r.id}`);
+    let each = '';
+    try { each = `${formatUnits(BigInt(input.amountInWeiPerRecipient), src.decimals)} ${src.symbol}`; } catch {}
+    ch.send({
+      content: `💸 <@${senderId}> paid ${rs.join(', ') || 'someone'}${each ? ` ${each}${rs.length > 1 ? ' each' : ''}` : ''} on ${src.chain}\n-# from ${src.who} \`${src.addr}\`\n${explorerUrl ?? `tx \`${transferHash}\``}`,
+      allowedMentions: { parse: [] },
+    }).catch((err) => console.error('[payouts] post failed:', err.message));
+  } catch (err) {
+    console.error('[payouts] post failed:', err.message);
+  }
+}
+
 // Money and write tools are tracked for the whole call — bankr swaps and the
 // agent move funds without going through quidliDrop.
 function trackedRunTool(name, input, ctx) {
@@ -1302,27 +1461,57 @@ function trackedRunTool(name, input, ctx) {
 }
 
 async function runTool(name, input, {
-  senderId, botId, senderApiKey, senderUser, userText = '', currentChannelId, contextId = null,
+  senderId, botId, senderApiKey, senderUser, userText = '', mentionedUsers = [], currentChannelId, contextId = null,
   documentInContext = false, quotesOther = false, confirmed = false, heldNotices = null,
 } = {}) {
   console.log(`[tool] ${name}`, JSON.stringify(input).slice(0, 120));
   if (shutdown.stopping && (MONEY_TOOLS.has(name) || isTrustAction(name))) {
     return JSON.stringify({ status: 'refused', executed: false, error: 'The bot is restarting. Nothing was sent or changed — tell the user to ask again in a minute.' });
   }
+  // The bot's own Discord ID resolves to a receive-only wallet nobody can spend.
+  if (MONEY_TOOLS.has(name) && Array.isArray(input?.recipients) && input.recipients.some((r) => isBotRecipient(r, botId))) {
+    return JSON.stringify({ status: 'refused', executed: false, error: 'Not sent: a recipient is this bot itself. Funds sent to the bot are stuck, because its wallet is receive-only. Tell the user to pick a person instead.' });
+  }
   // ── Held-transfer gate ───────────────────────────────────────────────────────
   // With a document in context, money-committing calls are parked, not run.
   // A sender with no usable key falls through: those branches refuse without
   // moving anything, and holding a transfer that can't run helps nobody.
   const guard = MONEY_TOOLS.has(name) && !confirmed ? getSendGuard(senderId) : null;
+  // Sends run straight away when they match what the sender typed and stay
+  // under the limits. A recipient or amount the sender never wrote is what
+  // injected text (web results, other people's messages, bios) produces, so
+  // that send waits for !confirm. The bot writes why; the model can't.
+  let preSrc = null;
+  let checkHold = null;
+  const checkNotes = [];
+  const isOwnerHere = BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID);
+  const dropKey = senderApiKey || (isOwnerHere ? OWNER_HOST_KEY : null);
+  if (DROP_SHAPED.has(name) && !confirmed && dropKey) {
+    preSrc = await dropSource(input, dropKey, senderApiKey, senderUser);
+    if (name === 'connect_drop' && preSrc.problem) {
+      heldNotices?.push(preSrc.problem);
+      return JSON.stringify({ status: 'refused', executed: false, error: preSrc.problem + ' The bot already posted this; do not restate the wallet address.' });
+    }
+    const missing = dropGroundCheck(input, userText, mentionedUsers, preSrc);
+    if (missing.length) { checkHold = 'ungrounded'; checkNotes.push(`-# Not in your message: ${missing.join(', ')}`); }
+    const cap = await capCheck(senderId, input, preSrc);
+    preSrc.usd = cap.usd;
+    if (cap.over) { checkHold = checkHold ?? 'cap'; checkNotes.push(`-# ${cap.over}`); }
+  }
   const holdWhy = SELF_HELD.has(name) ? null
     : holdReason({ tool: name, confirmed, documentInContext, quotesOther, guard })
-      ?? (ALWAYS_HELD.has(name) && MONEY_TOOLS.has(name) && !confirmed ? 'document' : null);
+      ?? (ALWAYS_HELD.has(name) && MONEY_TOOLS.has(name) && !confirmed ? 'document' : null)
+      ?? checkHold;
   if (holdWhy) {
     const isOwner = BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID);
     const hasKey = name === 'bankr_agent' ? !!getUserBankrKey(senderId)
       : name === 'bankr_swap_and_drop' ? !!getUserBankrKey(senderId) && !!senderApiKey
       : !!senderApiKey;
-    if (hasKey || isOwner) {
+    if (hasKey || (isOwner && (name.startsWith('bankr_') || OWNER_HOST_KEY))) {
+      // Who pays and whether they can, checked and written by the bot before
+      // anything is parked for !confirm.
+      if (name === 'connect_drop' && preSrc?.line) heldNotices?.push(preSrc.line);
+      for (const n of checkNotes) heldNotices?.push(n);
       const held = heldActions.hold({ tool: name, input, senderId, channelId: currentChannelId, contextId, reason: holdWhy });
       if (held.error) return JSON.stringify({ status: 'refused', executed: false, error: held.error });
       console.log(`[held] ${name} code=${held.code} sender=${senderId} reason=${holdWhy}`);
@@ -1333,7 +1522,7 @@ async function runTool(name, input, {
 
   // Keys connected before the guardrail existed were never asked. Ask once,
   // on their first send; this send runs as it always has.
-  const canSend = !!senderApiKey || (BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID));
+  const canSend = !!senderApiKey || (BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID) && !!OWNER_HOST_KEY);
   if (MONEY_TOOLS.has(name) && !SELF_HELD.has(name) && !confirmed && guard === null && canSend && claimSendGuardQuestion(senderId)) {
     heldNotices?.push(sendGuardPrompt('!'));
   }
@@ -1350,7 +1539,7 @@ async function runTool(name, input, {
       return JSON.stringify({ status: 'refused', executed: false, error: 'Trust attestations are not available from Connect right now. Nothing was written.' });
     }
     const isOwner = BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID);
-    const keyToUse = senderApiKey || (isOwner ? QUIDLI_API_KEY : null);
+    const keyToUse = senderApiKey || (isOwner ? OWNER_HOST_KEY : null);
     if (!keyToUse) return 'Error: this needs your own Quidli key. Tell the user, in your own words: get a key at connect.quid.li, then DM me `!connect <your-key>` to link it.';
     if (!confirmed) {
       const held = heldActions.hold({ tool: name, input, senderId, channelId: currentChannelId, contextId });
@@ -1390,7 +1579,7 @@ async function runTool(name, input, {
 
   if (MCP_CONFIRM_TOOLS.has(name) && mcpToolNames.has(name) && !confirmed) {
     const isOwner = BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID);
-    if (senderApiKey || isOwner) {
+    if (senderApiKey || (isOwner && OWNER_HOST_KEY)) {
       const held = heldActions.hold({ tool: name, input, senderId, channelId: currentChannelId, contextId });
       if (held.error) return JSON.stringify({ status: 'refused', executed: false, error: held.error });
       console.log(`[held] ${name} code=${held.code} sender=${senderId}`);
@@ -1406,13 +1595,19 @@ async function runTool(name, input, {
   // than a name list here guessing.
   if (mcpToolNames.has(name)) {
     const isOwner = BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID);
-    const keyToUse = senderApiKey || (isOwner ? QUIDLI_API_KEY : null);
+    const keyToUse = senderApiKey || (isOwner ? OWNER_HOST_KEY : null);
     try {
       // connect_drop's idempotency key comes from the bot, one per call: a
       // model reused the UUID spec's example key, and Connect treats a reused
       // key as the same send (2026-09-23). A 202 means Connect is still
       // setting up recipient wallets and sent nothing yet — it asks for a
       // retry with the same key, which only the bot can do now.
+      let src = null;
+      if (name === 'connect_drop') {
+        if (!keyToUse) return 'Error: this needs your own Quidli key. Tell the user, in your own words: get a key at connect.quid.li, then DM me `!connect <your-key>` to link it. Labr pays from your own Connect wallet.';
+        src = preSrc ?? await dropSource(input, keyToUse, senderApiKey, senderUser);
+        if (src.problem) { heldNotices?.push(src.problem); return JSON.stringify({ status: 'refused', executed: false, error: src.problem + ' The bot already posted this; do not restate the wallet address.' }); }
+      }
       const callInput = name === 'connect_drop' ? { ...input, idempotencyKey: crypto.randomUUID() } : input;
       let mcpOut = await mcpCallTool(name, callInput, keyToUse);
       for (let i = 0; name === 'connect_drop' && i < 5 && /"httpStatus":\s*202/.test(mcpOut); i++) {
@@ -1425,7 +1620,12 @@ async function runTool(name, input, {
         const explorerUrl = explorerTxUrl(input?.chainId ?? 8453, body?.transferHash);
         if (explorerUrl) _pendingExplorerUrls.push(explorerUrl);
         console.log('[drop] result:', JSON.stringify(body));
-        return JSON.stringify({ ...body, explorerUrl }, null, 2);
+        if (body?.transferHash && src?.line) {
+          heldNotices?.push(src.line.replace('Paying from', 'Paid from'));
+          recordSend(senderId, src.usd ?? (await capCheck(senderId, input, src)).usd);
+          postPayoutLog({ src, input, senderId, explorerUrl, transferHash: body.transferHash });
+        }
+        return JSON.stringify({ ...body, explorerUrl, paidFrom: src?.label ?? undefined }, null, 2);
       }
       return name === 'connect_me' ? redactConnectMe(mcpOut) : mcpOut;
     } catch (err) {
@@ -1491,7 +1691,7 @@ async function runTool(name, input, {
   if (name === 'bankr_swap_and_drop') {
     const isOwner = BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID);
     const bankrKey = getUserBankrKey(senderId) || (isOwner ? BANKR_API_KEY : null);
-    const quidliKey = senderApiKey || (isOwner ? QUIDLI_API_KEY : null);
+    const quidliKey = senderApiKey || (isOwner ? OWNER_HOST_KEY : null);
     if (!bankrKey) return JSON.stringify({ status: 'refused', executed: false, message: 'No Bankr key linked. Tell the user to DM me `!bankr <key>` (key needs Wallet API enabled, Read Only off).' });
     if (!quidliKey) return JSON.stringify({ status: 'refused', executed: false, message: 'No Quidli key linked. Tell the user to DM me `!connect <key>`.' });
     const rl = bankrRateCheck(String(senderId));
@@ -1536,7 +1736,7 @@ async function runTool(name, input, {
   }
   if (name === 'conditional_drop') {
     const isOwner = BOT_OWNER_ID && senderId === BOT_OWNER_ID;
-    const keyToUse = senderApiKey || (isOwner ? QUIDLI_API_KEY : null);
+    const keyToUse = senderApiKey || (isOwner ? OWNER_HOST_KEY : null);
     if (!keyToUse) {
       if (senderUser) {
         senderUser.send(
@@ -1565,7 +1765,7 @@ async function runTool(name, input, {
   }
   if (name === 'create_watcher') {
     const isOwner = BOT_OWNER_ID && senderId === BOT_OWNER_ID;
-    const keyToUse = senderApiKey || (isOwner ? QUIDLI_API_KEY : null);
+    const keyToUse = senderApiKey || (isOwner ? OWNER_HOST_KEY : null);
     if (!keyToUse) {
       if (senderUser) senderUser.send('To create watchers, connect your Quidli account first.\n\nGet your API key at https://connect.quid.li, then DM me:\n`!connect <your-api-key>`').catch(() => {});
       return JSON.stringify({ error: 'No Quidli API key connected. Sent a DM with setup instructions.' });
@@ -1643,7 +1843,7 @@ async function runTool(name, input, {
   }
   if (name === 'schedule_drop') {
     const isOwner = BOT_OWNER_ID && senderId === BOT_OWNER_ID;
-    const keyToUse = senderApiKey || (isOwner ? QUIDLI_API_KEY : null);
+    const keyToUse = senderApiKey || (isOwner ? OWNER_HOST_KEY : null);
     if (!keyToUse) {
       if (senderUser) {
         senderUser.send(
@@ -2466,6 +2666,7 @@ async function handleMessage(message) {
     senderApiKey,
     senderUser: message.author,
     userText: message.content,
+    mentionedUsers: [...(message.mentions?.users?.values?.() ?? [])].map((u) => ({ id: u.id, username: u.username, globalName: u.globalName ?? null })),
     currentChannelId: message.channelId,
     contextId,
     documentInContext,
@@ -2925,7 +3126,7 @@ async function handleConfirmCommand(message, { verb, code }) {
       : `❌ \`${action.code}\` did not go through: ${String(raw ?? '').slice(0, 300)}`);
   } else if (action.tool === 'connect_drop') {
     await say(result.transferHash
-      ? `✅ Sent (\`${action.code}\`).${result.explorerUrl ? `\n🔗 ${result.explorerUrl}` : `\nTransfer hash: \`${result.transferHash}\``}`
+      ? `✅ Sent (\`${action.code}\`).${result.explorerUrl ? `\n🔗 ${result.explorerUrl}` : `\nTransfer hash: \`${result.transferHash}\``}${result.paidFrom ? `\n-# Paid from: ${result.paidFrom}` : ''}`
       : `❌ \`${action.code}\` did not go through: ${String(result.error ?? result.message ?? raw).slice(0, 300)}`);
   } else if (result.success) {
     await say(`✅ \`${action.code}\`: ${result.message ?? 'done'}${result.jobId ? ` (job \`${result.jobId}\`)` : ''}${result.watcherId ? ` (watcher \`${result.watcherId}\`)` : ''}`);
@@ -2955,7 +3156,7 @@ async function checkWatchers(message) {
 
     const isOwner = BOT_OWNER_ID && watcher.sender_id === BOT_OWNER_ID;
     const senderApiKey = getUserApiKey(watcher.sender_id);
-    const keyToUse = senderApiKey || (isOwner ? QUIDLI_API_KEY : null);
+    const keyToUse = senderApiKey || (isOwner ? OWNER_HOST_KEY : null);
     if (!keyToUse) {
       console.log(`[watcher] ${watcher.id} triggered but no API key for sender ${watcher.sender_id}`);
       continue;
