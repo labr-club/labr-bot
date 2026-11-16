@@ -8,7 +8,7 @@ set -euo pipefail
 
 DIR="${LABR_DIR:-$HOME/labr}"
 REPO="${LABR_REPO:-https://github.com/labr-club/labr-bot.git}"
-PRE_TAG="labr-pre-rebase"   # the patched code as it ran before this update
+PRE_TAG="labr/labr-pre-rebase"   # branch: the patched code as it ran before this update
 MODE="${1:-}"
 
 [ -d "$DIR/.git" ] || { echo "$DIR is not a git checkout, stopping."; exit 1; }
@@ -16,7 +16,7 @@ MODE="${1:-}"
 cd "$DIR"
 
 git remote get-url labr >/dev/null 2>&1 || git remote add labr "$REPO"
-git fetch --quiet --tags labr
+git fetch --quiet labr
 
 # 1. Is what runs here the code this repo was built from? The server allowlist
 #    was never saved as a patch, so a small difference there is expected. Any
