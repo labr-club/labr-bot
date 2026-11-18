@@ -15,7 +15,9 @@ MODE="${1:-}"
 [ -f "$DIR/.env" ] || { echo "No $DIR/.env, stopping."; exit 1; }
 cd "$DIR"
 
-git remote get-url labr >/dev/null 2>&1 || git remote add labr "$REPO"
+# Always point the remote at the source given this time: an earlier run may have
+# left it on an older bundle.
+if git remote get-url labr >/dev/null 2>&1; then git remote set-url labr "$REPO"; else git remote add labr "$REPO"; fi
 git fetch --quiet labr
 
 # 1. Is what runs here the code this repo was built from? labr-running is a
