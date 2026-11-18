@@ -52,7 +52,7 @@ const {
   QUIDLI_API_KEY,
   BANKR_API_KEY,                 // Optional — owner's Bankr Agent API key; others link their own via bankr command               // Optional — if set, skips x402 payment
   DISCORD_ALLOWED_ROLES = '',   // Comma-separated role names allowed to use the bot
-  // Comma-separated server (guild) IDs the bot may stay in. Empty = any server.
+  // Comma-separated guild (server) IDs the bot may stay in. Empty = any server.
   // Set it before making the bot public: role checks match role NAMES, so any
   // server could create a matching role. The bot leaves every other server.
   DISCORD_ALLOWED_GUILDS = '',
@@ -115,12 +115,11 @@ const OWNER_HOST_KEY = OWNER_USES_HOST_KEY === 'false' ? null : QUIDLI_API_KEY;
 const ALLOWED_GUILDS = new Set(
   DISCORD_ALLOWED_GUILDS.split(',').map((s) => s.trim()).filter(Boolean)
 );
-
-// Leave a server that is not on the allowlist. Empty allowlist = stay everywhere.
-async function leaveIfNotAllowed(guild) {
-  if (ALLOWED_GUILDS.size === 0 || ALLOWED_GUILDS.has(guild.id)) return false;
+const guildAllowed = (id) => ALLOWED_GUILDS.size === 0 || ALLOWED_GUILDS.has(String(id));
+function leaveIfNotAllowed(guild) {
+  if (guildAllowed(guild.id)) return false;
   console.warn(`[guilds] leaving ${guild.name} (${guild.id}): not in DISCORD_ALLOWED_GUILDS`);
-  await guild.leave().catch((err) => console.error('[guilds] leave failed:', err?.message ?? err));
+  guild.leave().catch((err) => console.error('[guilds] leave failed:', err.message));
   return true;
 }
 const ALLOWED_ROLES = new Set(
@@ -3393,9 +3392,10 @@ client.once(Events.ClientReady, (c) => {
   } else {
     console.log('   Mode: respond when @mentioned');
   }
-  // Leave servers that are not allowed, then store the first allowed guild for role lookups
-  for (const g of c.guilds.cache.values()) leaveIfNotAllowed(g);
-  activeGuild = c.guilds.cache.find((g) => ALLOWED_GUILDS.size === 0 || ALLOWED_GUILDS.has(g.id)) ?? null;
+  // Leave any server not on the allowlist, then store the first allowed guild for role lookups
+  c.guilds.cache.forEach((g) => leaveIfNotAllowed(g));
+  if (ALLOWED_GUILDS.size > 0) console.log(`   Allowed guilds: ${[...ALLOWED_GUILDS].join(', ')}`);
+  activeGuild = c.guilds.cache.find((g) => guildAllowed(g.id)) ?? null;
   if (activeGuild) console.log(`   Guild: ${activeGuild.name}`);
   // Re-queue any scheduled drops that survived a restart
   loadPendingDrops();
@@ -3405,8 +3405,11 @@ client.once(Events.ClientReady, (c) => {
   registerMcpTools();
 });
 
+client.on(Events.GuildCreate, (guild) => { leaveIfNotAllowed(guild); });
+
 client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot) return;
+  if (message.guild && !guildAllowed(message.guild.id)) return;
   // !confirm / !cancel work in DMs and in any channel, mention or not. Codes
   // are bound to the requesting user, so nobody else can fire one.
   const confirmCmd = parseConfirmCommand(message.content, message.client.user?.id);
@@ -3451,8 +3454,6 @@ client.on(Events.MessageCreate, async (message) => {
 });
 
 // An 'error' event with no listener throws and takes the process down.
-client.on(Events.GuildCreate, (guild) => { leaveIfNotAllowed(guild); });
-
 client.on(Events.Error, (err) => console.error('[discord] client error:', err?.message ?? err));
 
 // Before this there were no signal handlers: pm2's SIGINT ended the process

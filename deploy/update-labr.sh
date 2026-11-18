@@ -8,7 +8,7 @@ set -euo pipefail
 
 DIR="${LABR_DIR:-$HOME/labr}"
 REPO="${LABR_REPO:-https://github.com/labr-club/labr-bot.git}"
-PRE_TAG="labr/labr-pre-rebase"   # branch: the patched code as it ran before this update
+PRE_TAG="labr/labr-running"   # branch: the exact code that ran on the Mac mini before this update
 MODE="${1:-}"
 
 [ -d "$DIR/.git" ] || { echo "$DIR is not a git checkout, stopping."; exit 1; }
@@ -18,9 +18,9 @@ cd "$DIR"
 git remote get-url labr >/dev/null 2>&1 || git remote add labr "$REPO"
 git fetch --quiet labr
 
-# 1. Is what runs here the code this repo was built from? The server allowlist
-#    was never saved as a patch, so a small difference there is expected. Any
-#    other difference means there is a local change this repo does not have.
+# 1. Is what runs here the code this repo was built from? labr-running is a
+#    byte-exact snapshot of it, so the expected answer is "none". Any difference
+#    means there is a local change this repo does not have.
 echo "== Differences between the running code and $PRE_TAG (bot.js, held-actions.js):"
 if git diff --quiet "$PRE_TAG" -- bot.js held-actions.js; then
   echo "none"
@@ -28,8 +28,8 @@ else
   git diff --stat "$PRE_TAG" -- bot.js held-actions.js
   git diff "$PRE_TAG" -- bot.js held-actions.js > "$HOME/labr-running-vs-repo.diff"
   echo "Full diff saved to $HOME/labr-running-vs-repo.diff"
-  echo "Read it. If it only touches the server allowlist (DISCORD_ALLOWED_GUILDS),"
-  echo "re-run with LABR_ACCEPT_DIFF=1. Anything else needs porting into the repo first."
+  echo "Something changed here since the snapshot. Port it into the repo first,"
+  echo "or re-run with LABR_ACCEPT_DIFF=1 to go ahead anyway (the backup keeps it)."
   [ "${LABR_ACCEPT_DIFF:-0}" = "1" ] || [ "$MODE" = "--check" ] || exit 1
 fi
 [ "$MODE" = "--check" ] && exit 0

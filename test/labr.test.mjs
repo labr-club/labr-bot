@@ -144,3 +144,24 @@ test('the Labr prompt file exists, names Labr, and carries the chain rule', () =
   assert.doesNotMatch(prompt, /`/, 'no backticks: the prompt may still be embedded in .env');
   assert.doesNotMatch(prompt, /bounty|airdrop/i);
 });
+
+test('server allowlist: listed servers stay, others are left, and their messages are ignored', () => {
+  const left = [];
+  const make = (ids) => new Function('ALLOWED_GUILDS', 'console',
+    `${SRC.match(/^const guildAllowed = .*$/m)[0]}\n${grab('leaveIfNotAllowed')}\nreturn { guildAllowed, leaveIfNotAllowed };`)(new Set(ids), quiet);
+  const guild = (id) => ({ id, name: `g${id}`, leave: async () => { left.push(id); } });
+
+  const open = make([]);
+  assert.equal(open.guildAllowed('1'), true, 'empty allowlist = any server');
+  assert.equal(open.leaveIfNotAllowed(guild('1')), false);
+
+  const closed = make(['1560388923770019940']);
+  assert.equal(closed.guildAllowed('1560388923770019940'), true);
+  assert.equal(closed.leaveIfNotAllowed(guild('1560388923770019940')), false);
+  assert.equal(closed.leaveIfNotAllowed(guild('42')), true);
+  assert.deepEqual(left, ['42']);
+
+  assert.match(SRC, /client\.on\(Events\.MessageCreate, async \(message\) => \{\n  if \(message\.author\.bot\) return;\n  if \(message\.guild && !guildAllowed\(message\.guild\.id\)\) return;/,
+    'a message from a server that is not allowed is dropped before anything else runs');
+  assert.match(SRC, /client\.on\(Events\.GuildCreate, \(guild\) => \{ leaveIfNotAllowed\(guild\); \}\);/);
+});

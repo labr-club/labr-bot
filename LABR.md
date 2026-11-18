@@ -7,6 +7,13 @@ rebased when DiscoCentaur moves.
 
 Base: DiscoCentaur `b764cf1` (2026-11-12).
 
+The `labr-running` branch is a byte-exact snapshot of the code that ran on the
+Mac mini before the first update from this repo (2026-11-16). Two things in
+`main` were **not** in that running code, so they go live with the first update:
+the plain-text @name lookup with the "this pays you" hold (`labr-names.patch`),
+and the wording rule (`labr-wording.patch`). Until then the running bot still
+said the treasury "funds bounties".
+
 ## What Labr adds
 
 | Change | What it does |
