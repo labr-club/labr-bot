@@ -56,6 +56,9 @@ const {
   // Set it before making the bot public: role checks match role NAMES, so any
   // server could create a matching role. The bot leaves every other server.
   DISCORD_ALLOWED_GUILDS = '',
+  // How the owner approves a contributor payout: 'confirm' (default, the !confirm
+  // code every other send uses) or 'world_id' (opt-in, needs the WORLD_ID_* settings).
+  PAYOUT_APPROVAL = 'confirm',
   // 'false' = the owner pays from their own linked key like everyone else, and
   // the host QUIDLI_API_KEY never pays for a send. Default keeps the old fallback.
   OWNER_USES_HOST_KEY = 'true',
@@ -1242,7 +1245,11 @@ const tools = [
   },
   {
     name: 'payout',
-    description: 'Reward the contributors of a GitHub repo for their MERGED pull requests, out of a budget the user names. One call does everything: it scores the work, posts the proposed split to the channel itself, and then asks the owner to approve the payment with World ID (a link sent by DM); nothing is paid until they do. You do NOT get the amounts and must never state, guess or retype any figures, shares or contributor names — the table is posted for you. Open PRs are not counted. Takes 60-120 seconds. Call it once per request. Never say a payout was paid unless a later bot record says it ran.',
+    description: 'Reward the contributors of a GitHub repo for their MERGED pull requests, out of a budget the user names. One call does everything: it scores the work, posts the proposed split to the channel itself, and '
+      + (String(process.env.PAYOUT_APPROVAL ?? '').trim().toLowerCase() === 'world_id'
+        ? 'then asks the owner to approve the payment with World ID (a link sent by DM); nothing is paid until they do.'
+        : 'holds the payment for the owner to confirm with a code; nothing is paid until they do.')
+      + ' You do NOT get the amounts and must never state, guess or retype any figures, shares or contributor names — the table is posted for you. Open PRs are not counted. Takes 60-120 seconds. Call it once per request. Never say a payout was paid unless a later bot record says it ran.',
     input_schema: {
       type: 'object',
       properties: {
@@ -1289,8 +1296,9 @@ function bankrRateCheck(senderId) {
 }
 // Outcomes of !confirm / !cancel, delivered to the channel's next model turn.
 const heldOutcomeRecords = createRecordQueue();
-// Payouts are approved by a World ID check (device flow), not by !confirm.
-// The audit write throws on failure on purpose: no record, no payment.
+// World ID approval for payouts (device flow) is opt-in: PAYOUT_APPROVAL=world_id.
+// The default is the !confirm code. The audit write throws on failure on
+// purpose: no record, no payment.
 const worldAudit = (event) => appendFileSync(new URL('./world-approvals.jsonl', import.meta.url), JSON.stringify(event) + '\n');
 const worldGate = createWorldGate({ cfg: loadWorldConfig(), audit: worldAudit });
 const payoutApprover = createPayoutApprover({
@@ -1301,6 +1309,7 @@ const payoutApprover = createPayoutApprover({
   track: (p) => shutdown.track(p, 'payout'),
   isStopping: () => shutdown.stopping,
 });
+const PAYOUT_USES_WORLD_ID = String(PAYOUT_APPROVAL).trim().toLowerCase() === 'world_id';
 // Explorer links from real drops per conversation, so a later turn can repeat them.
 const verifiedTxLinks = createVerifiedLinkStore();
 
@@ -1789,10 +1798,19 @@ async function runTool(name, input, {
     const isOwner = BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID);
     if (!isOwner) return JSON.stringify({ status: 'refused', executed: false, message: 'Only the bot owner can run a payout.' });
 
-    // Payouts are approved only through World ID. A confirmed call (the old
-    // !confirm path) never pays, so nothing can route around the check.
-    if (confirmed) return JSON.stringify({ status: 'refused', executed: false, message: 'Payouts are approved with World ID, not !confirm. Nothing was paid.' });
-    if (!worldGate.configured) return JSON.stringify({ status: 'refused', executed: false, message: 'World ID is not configured on the host, so payouts are disabled. Nothing was paid.' });
+    if (PAYOUT_USES_WORLD_ID) {
+      // Opt-in mode: approved only through World ID. A confirmed call never
+      // pays here, so nothing can route around the check, and a host that asked
+      // for World ID without configuring it pays nothing rather than falling back.
+      if (confirmed) return JSON.stringify({ status: 'refused', executed: false, message: 'Payouts are approved with World ID, not !confirm. Nothing was paid.' });
+      if (!worldGate.configured) return JSON.stringify({ status: 'refused', executed: false, message: 'PAYOUT_APPROVAL is world_id but World ID is not configured on the host, so payouts are disabled. Nothing was paid.' });
+    } else if (confirmed) {
+      // Default: the owner typed !confirm <code> for the round the bot posted.
+      console.log(`[payout] execute label=${input.label}`);
+      const done = await payoutExecute({ label: input.label });
+      console.log(`[payout] execute ${done.status}`);
+      return JSON.stringify(done, null, 2);
+    }
 
     // Check the extraction against what the user wrote before spending a
     // scoring run on it. A window or budget the model supplied on its own pays
@@ -1822,6 +1840,15 @@ async function runTool(name, input, {
 
     const label = proposal.label;
     const heldInput = { ...input, label, summary: summariseRound(label) ?? undefined };
+
+    if (!PAYOUT_USES_WORLD_ID) {
+      const held = heldActions.hold({ tool: name, input: heldInput, senderId, channelId: currentChannelId, contextId });
+      if (held.error) return JSON.stringify({ status: 'refused', executed: false, error: held.error });
+      console.log(`[held] payout code=${held.code} label=${label}`);
+      heldNotices?.push(describeHeldAction({ code: held.code, tool: name, input: heldInput }));
+      return heldToolResult(held.code);
+    }
+
     const sayInChannel = async (text) => {
       const ch = await client.channels.fetch(currentChannelId).catch(() => null);
       if (ch?.isTextBased?.()) await ch.send(String(text).slice(0, 1900)).catch((e) => console.error('[payout] channel post failed:', e?.message ?? e));
@@ -3380,6 +3407,7 @@ client.once(Events.ClientReady, (c) => {
   console.log(`✅ Claudetaur ready — logged in as ${c.user.tag}`);
   console.log(`   Default LLM: ${DEFAULT_LLM_PROVIDER} (${defaultModel})`);
   console.log(`   Prompt: ${PROMPT_SOURCE}`);
+  console.log(`   Payout approval: ${PAYOUT_USES_WORLD_ID ? (worldGate.configured ? 'World ID' : 'World ID requested but NOT configured, payouts disabled') : '!confirm'}`);
   if (GEMINI_API_KEY) console.log(`   Gemini: ${GEMINI_MODEL} ✓`);
   if (OPENAI_API_KEY) console.log(`   OpenAI: ${OPENAI_MODEL} ✓`);
   if (NOUS_API_KEY) console.log(`   Hermes: ${NOUS_MODEL} ✓ (via Nous Portal — 200+ models, per-user override with !llm hermes <key> <model>)`);

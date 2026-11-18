@@ -27,6 +27,7 @@ said the treasury "funds bounties".
 | Wording | Treasury "funds paid tasks". The bot never says "bounty" or "airdrop". |
 | Chains | Chain names in bot-written lines come from Connect at startup, with a built-in fallback. |
 | Prompt | `SYSTEM_PROMPT_FILE=labr-prompt.txt`: the prompt lives in this repo, not inline in `.env`. |
+| Payout approval | `!confirm` by default. World ID is opt-in with `PAYOUT_APPROVAL=world_id`. |
 
 ## Not covered
 
@@ -34,12 +35,22 @@ said the treasury "funds bounties".
 - The contributor `payout` tool pays through the payout CLI and reports in the channel it was asked in, not in `#payouts`.
 - Scheduled, conditional and watcher sends are checked against the limits when they are created, and are not added to the daily total when they run.
 
-## Contributor payouts need World ID
+## Contributor payouts: `!confirm` by default, World ID optional
 
-Since DiscoCentaur `cfb8e1d`, the `payout` tool is approved through World ID and
-is **disabled** unless `WORLD_ID_CLIENT_ID`, `WORLD_ID_CLIENT_SECRET` and
-`WORLD_ID_TREASURER_SUBS` are set. `!confirm` no longer pays a payout. See the
-World ID section of `README.md`.
+DiscoCentaur `cfb8e1d` made World ID the only way to approve the `payout` tool.
+Labr reverses the default: the owner approves a payout with the `!confirm` code,
+like any other held send. World ID stays available as an option:
+
+```
+PAYOUT_APPROVAL=world_id
+WORLD_ID_CLIENT_ID=...
+WORLD_ID_CLIENT_SECRET=...
+WORLD_ID_TREASURER_SUBS=...
+```
+
+With `PAYOUT_APPROVAL=world_id` set but the `WORLD_ID_*` values missing, payouts
+are disabled; the bot does not fall back to `!confirm` in that case. The startup
+log prints the mode as `Payout approval: ...`.
 
 ## Settings the Labr instance uses
 

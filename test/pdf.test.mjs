@@ -243,6 +243,9 @@ function buildRunTool(overrides = {}) {
     scheduleDropJob: () => {},
     executeConditionalDrop: () => {},
     client: { users: { fetch: async () => null }, channels: { fetch: async () => null } },
+    // World ID is opt-in (PAYOUT_APPROVAL=world_id). On here so the World ID
+    // tests below run that mode; the default-mode tests override it.
+    PAYOUT_USES_WORLD_ID: true,
     worldGate: { configured: true },
     payoutApprover: {
       requests: [],
@@ -290,7 +293,7 @@ for (const [tool, input] of Object.entries(moneyInputs)) {
   });
 }
 
-test('payout proposes, posts the split, and asks World ID — never !confirm', async () => {
+test('payout with World ID turned on: proposes, posts the split, and asks World ID, never !confirm', async () => {
   const { runTool, calls, deps } = buildRunTool();
   const heldNotices = [];
   const dms = [];
@@ -321,7 +324,7 @@ test('payout is cancelled if the owner cannot be DMed the link', async () => {
   assert.deepEqual(calls, []);
 });
 
-test('payout is disabled when World ID is not configured', async () => {
+test('payout with World ID turned on but not configured pays nothing (no silent fallback)', async () => {
   const { runTool, calls, deps } = buildRunTool();
   deps.worldGate.configured = false;
   const out = JSON.parse(await runTool('payout', { repo: 'a/b', budget: '100' }, { senderId: 'owner', heldNotices: [], senderUser: { send: async () => {} } }));
@@ -360,10 +363,10 @@ test('every runTool branch that spends or schedules money is gated', () => {
   const spending = branches
     .filter(([, , body]) => /quidliDrop\(|bankrAgent\(|bankrSwapAndDrop\(|payoutExecute\(|INSERT INTO (scheduled_drops|watchers)/.test(body))
     .map(([, name]) => name);
-  // payout is gated by World ID (payout-approval.js), not by the hold store, so
-  // runTool must never call payoutExecute itself.
-  assert.ok(!spending.includes('payout'), 'runTool must not execute a payout directly');
-  assert.deepEqual(spending.sort(), [...MONEY_TOOLS].filter((t) => t !== 'payout' && !MCP_SEND_TOOLS.has(t)).sort(),
+  // payout executes in runTool only on the confirmed (!confirm) call; in World ID
+  // mode that call is refused and payout-approval.js runs it instead.
+  assert.ok(spending.includes('payout'));
+  assert.deepEqual(spending.sort(), [...MONEY_TOOLS].filter((t) => !MCP_SEND_TOOLS.has(t)).sort(),
     'a money-moving tool was added or removed — update MONEY_TOOLS in held-actions.js');
 });
 
@@ -856,4 +859,48 @@ test('Labr: a wallet that cannot cover the send is refused with the bot-written 
   assert.deepEqual(calls, []);
   assert.deepEqual(logs, []);
   assert.deepEqual(notices, [problem]);
+});
+
+
+// ─── payout approval: !confirm is the default, World ID is opt-in ────────────
+
+test('payout by default: proposes, posts the split, and waits for !confirm; World ID is never involved', async () => {
+  const { runTool, calls, deps } = buildRunTool({ PAYOUT_USES_WORLD_ID: false, worldGate: { configured: false } });
+  const heldNotices = [];
+  const dms = [];
+  const out = JSON.parse(await runTool('payout', { repo: 'a/b', budget: '100' }, { senderId: 'owner', heldNotices, senderUser: { send: async (t) => { dms.push(t); } } }));
+  assert.equal(out.status, 'held_for_confirmation');
+  assert.equal(out.executed, false);
+  assert.deepEqual(calls, [], 'nothing is paid before !confirm');
+  assert.equal(deps.heldActions.size, 1, 'one hold exists for the round');
+  assert.match(heldNotices.join('\n'), /@alice — 100 BNKR/, 'the bot posts the split');
+  assert.match(heldNotices.join('\n'), new RegExp(`!confirm ${out.code}`));
+  assert.doesNotMatch(heldNotices.join('\n'), /World ID/);
+  assert.deepEqual(deps.payoutApprover.requests, [], 'no World ID request is made');
+  assert.equal(dms.length, 0, 'no approval link is sent');
+
+  const done = JSON.parse(await runTool('payout', { repo: 'a/b', budget: '100', label: 'dc-demo-1' }, { senderId: 'owner', confirmed: true }));
+  assert.equal(done.status, 'ok');
+  assert.deepEqual(calls, [{ tool: 'payout' }], 'the confirmed call pays the round once');
+});
+
+test('payout by default works with World ID fully configured too: the setting decides, not the keys', async () => {
+  const { runTool, deps } = buildRunTool({ PAYOUT_USES_WORLD_ID: false });
+  const out = JSON.parse(await runTool('payout', { repo: 'a/b', budget: '100' }, { senderId: 'owner', heldNotices: [], senderUser: { send: async () => {} } }));
+  assert.equal(out.status, 'held_for_confirmation');
+  assert.deepEqual(deps.payoutApprover.requests, []);
+});
+
+test('payout by default is still owner-only, confirmed or not', async () => {
+  const { runTool, calls } = buildRunTool({ PAYOUT_USES_WORLD_ID: false });
+  for (const confirmed of [false, true]) {
+    const out = JSON.parse(await runTool('payout', { repo: 'a/b', budget: '100', label: 'dc-demo-1' }, { senderId: 'someone', confirmed }));
+    assert.equal(out.status, 'refused');
+  }
+  assert.deepEqual(calls, []);
+});
+
+test('the payout approval mode is read from PAYOUT_APPROVAL and defaults to confirm', () => {
+  assert.match(SRC, /PAYOUT_APPROVAL = 'confirm',/);
+  assert.match(SRC, /const PAYOUT_USES_WORLD_ID = String\(PAYOUT_APPROVAL\)\.trim\(\)\.toLowerCase\(\) === 'world_id';/);
 });

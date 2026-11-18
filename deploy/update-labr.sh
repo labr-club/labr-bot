@@ -54,14 +54,11 @@ npm ci --omit=dev --silent
 grep -q '^SYSTEM_PROMPT_FILE=' .env || printf '\nSYSTEM_PROMPT_FILE=labr-prompt.txt\n' >> .env
 
 node --check bot.js
-if ! grep -q '^WORLD_ID_CLIENT_ID=.\+' .env; then
-  echo "== Note: WORLD_ID_* is not set, so the contributor payout tool is disabled until it is."
-fi
 
 # 5. Restart and show the first lines of the log.
 pm2 restart labr --update-env
 sleep 6
 pm2 logs labr --lines 25 --nostream
 echo
-echo "Look for: 'Prompt: file labr-prompt.txt' and 'Chains: N from Connect'."
+echo "Look for: 'Prompt: file labr-prompt.txt', 'Payout approval: !confirm' and 'Chains: N from Connect'."
 echo "To go back: pm2 stop labr && rm -rf $DIR && cp -a $BACKUP $DIR && pm2 restart labr"
