@@ -23,8 +23,10 @@ git fetch --quiet labr
 # 1. Is what runs here the code this repo was built from? labr-running is a
 #    byte-exact snapshot of it, so the expected answer is "none". Any difference
 #    means there is a local change this repo does not have.
-echo "== Differences between the running code and $PRE_TAG (bot.js, held-actions.js):"
-if git diff --quiet "$PRE_TAG" -- bot.js held-actions.js; then
+if git merge-base --is-ancestor HEAD labr/main 2>/dev/null && git diff --quiet HEAD -- bot.js held-actions.js; then
+  # Already on this repo's code with no local edits (an earlier update ran).
+  echo "== Running this repo's code at $(git rev-parse --short HEAD); target is $(git rev-parse --short labr/main)."
+elif echo "== Differences between the running code and $PRE_TAG (bot.js, held-actions.js):" && git diff --quiet "$PRE_TAG" -- bot.js held-actions.js; then
   echo "none"
 else
   git diff --stat "$PRE_TAG" -- bot.js held-actions.js
