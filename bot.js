@@ -47,7 +47,7 @@ const {
   QUIDLI_API_KEY,
   BANKR_API_KEY,                 // Optional — owner's Bankr Agent API key; others link their own via bankr command               // Optional — if set, skips x402 payment
   DISCORD_ALLOWED_ROLES = '',   // Comma-separated role names allowed to use the bot
-  // Comma-separated server (guild) IDs the bot may stay in. Empty = any server.
+  // Comma-separated guild (server) IDs the bot may stay in. Empty = any server.
   // Set it before making the bot public: role checks match role NAMES, so any
   // server could create a matching role. The bot leaves every other server.
   DISCORD_ALLOWED_GUILDS = '',
@@ -110,12 +110,11 @@ const OWNER_HOST_KEY = OWNER_USES_HOST_KEY === 'false' ? null : QUIDLI_API_KEY;
 const ALLOWED_GUILDS = new Set(
   DISCORD_ALLOWED_GUILDS.split(',').map((s) => s.trim()).filter(Boolean)
 );
-
-// Leave a server that is not on the allowlist. Empty allowlist = stay everywhere.
-async function leaveIfNotAllowed(guild) {
-  if (ALLOWED_GUILDS.size === 0 || ALLOWED_GUILDS.has(guild.id)) return false;
+const guildAllowed = (id) => ALLOWED_GUILDS.size === 0 || ALLOWED_GUILDS.has(String(id));
+function leaveIfNotAllowed(guild) {
+  if (guildAllowed(guild.id)) return false;
   console.warn(`[guilds] leaving ${guild.name} (${guild.id}): not in DISCORD_ALLOWED_GUILDS`);
-  await guild.leave().catch((err) => console.error('[guilds] leave failed:', err?.message ?? err));
+  guild.leave().catch((err) => console.error('[guilds] leave failed:', err.message));
   return true;
 }
 const ALLOWED_ROLES = new Set(
@@ -1351,35 +1350,6 @@ async function dropSource(input, apiKey, senderApiKey, senderUser) {
 
 const DROP_SHAPED = new Set(['connect_drop', 'schedule_drop', 'conditional_drop']);
 
-// "@Guillaume" typed as text is not a Discord mention: no ID comes with it, and
-// the model filled the gap with the only ID it had, the sender's. The bot looks
-// each plain-text @name up among the server's members and tells the model.
-async function resolvePlainNames(message) {
-  const text = String(message.content ?? '').replace(/<[@#][!&]?\d+>/g, ' ');
-  const botName = String(message.client?.user?.username ?? '').toLowerCase();
-  const names = [...new Set([...text.matchAll(/(?:^|[^\w@])@([\w.\-]{2,32})/g)].map((m) => m[1].replace(/[.\-]+$/, '')))]
-    .filter((n) => n.length > 1 && !['everyone', 'here'].includes(n.toLowerCase()) && n.toLowerCase() !== botName);
-  if (!names.length || !message.guild) return { users: [], note: '' };
-  try { await ensureMembersFetched(); } catch { return { users: [], note: '' }; }
-  const users = [];
-  const lines = [];
-  for (const n of names.slice(0, 10)) {
-    const q = n.toLowerCase();
-    const hits = message.guild.members.cache.filter((m) => !m.user.bot
-      && [m.user.username, m.user.globalName, m.displayName, m.nickname].filter(Boolean).some((x) => String(x).toLowerCase() === q));
-    if (hits.size === 1) {
-      const m = hits.first();
-      users.push({ id: m.id, username: m.user.username, globalName: m.user.globalName ?? null });
-      lines.push(`@${n} = Discord ID ${m.id} (username ${m.user.username}); pay them as {type:"discord", id:"${m.id}"}`);
-    } else if (hits.size > 1) {
-      lines.push(`@${n} matches ${hits.size} members (${[...hits.values()].slice(0, 5).map((m) => `${m.user.username} = ${m.id}`).join(', ')}); ask which one before sending`);
-    } else {
-      lines.push(`@${n}: no member of this server has that name. Never substitute another Discord user. Ask the user to pick them from the @ list, or which platform the handle is on`);
-    }
-  }
-  return { users, note: `\n[Plain-text @names, resolved by the bot: ${lines.join('; ')}]` };
-}
-
 // What in the send isn't in the sender's own message: recipients they never
 // named and an amount they never wrote. Empty = matches.
 function dropGroundCheck(input, userText, mentionedUsers = [], src = null) {
@@ -1476,7 +1446,6 @@ const WALLET_RULES = `
 - Labr's Connect key belongs to the bot. Never ask anyone to link it, and never suggest it for their own sends. Everyone pays from their own Connect wallet, linked by DMing \`!connect <their-key>\`.
 - When someone asks for their wallet: connect_drop_balance's walletAddress is the wallet they pay FROM; connect_me's defaultEthWalletAddress / defaultSolanaWalletAddress is where they RECEIVE. Give both, labelled "sends from" and "receives at". If they have no key linked, say they need to DM \`!connect <key>\` first.
 - Never write a wallet address you did not get from a tool result or from the facts below.
-- Say "paid task", "reward" or "payout", never "bounty" or "airdrop".
 - Never mention anyone's balance in a server channel unless they asked for their balance. Check it with tools as needed, but don't say it (no "You have ~5.8 USDC"). In a DM it's fine.`;
 function systemPrompt() {
   return SYSTEM_PROMPT + WALLET_RULES + walletFacts;
@@ -1489,10 +1458,10 @@ async function loadWalletFacts(botUserId) {
   const look = await addr(async () => String(await mcpCallTool('connect_lookup', { recipients: [{ type: 'discord', id: String(botUserId) }] }, QUIDLI_API_KEY)));
   const evmR = look?.match(/0x[a-fA-F0-9]{40}/)?.[0] ?? null;
   const lines = [];
-  if (evmT || solT) lines.push(`- Your wallet is the Labr treasury. It funds paid tasks. ${[evmT && `Base/EVM: \`${evmT}\``, solT && `Solana: \`${solT}\``].filter(Boolean).join(' · ')}`);
+  if (evmT || solT) lines.push(`- Your wallet is the Labr treasury. It funds bounties. ${[evmT && `Base/EVM: \`${evmT}\``, solT && `Solana: \`${solT}\``].filter(Boolean).join(' · ')}`);
   if (evmR) lines.push(`- Internal, do not volunteer: your Discord account also resolves in Connect to \`${evmR}\`, which is receive-only and can never be spent. Mention it only if someone wants to send to @Labr by handle or asks about that address; then say funds sent there are stuck and give the treasury instead.`);
   if (!lines.length) return;
-  walletFacts = `\n\n## Your wallet (facts written by the bot from Connect)\n${lines.join('\n')}\nWhen asked for your wallet, answer in one short line: "My wallet is the Labr treasury, which funds paid tasks:" then the addresses. Nothing else unless asked.`;
+  walletFacts = `\n\n## Your wallet (facts written by the bot from Connect)\n${lines.join('\n')}\nWhen asked for your wallet, answer in one short line: "My wallet is the Labr treasury, which funds bounties:" then the addresses. Nothing else unless asked.`;
   console.log(`   Wallets: treasury ${evmT ?? '-'} / ${solT ?? '-'}, bot ID wallet ${evmR ?? '-'}`);
 }
 
@@ -1552,13 +1521,8 @@ async function runTool(name, input, {
       heldNotices?.push(preSrc.problem);
       return JSON.stringify({ status: 'refused', executed: false, error: preSrc.problem + ' The bot already posted this; do not restate the wallet address.' });
     }
-    const myName = String(senderUser?.username ?? '').toLowerCase();
-    const isMe = (r) => r?.type === 'discord' && (String(r.id ?? '') === String(senderId) || (!!myName && String(r.username ?? '').replace(/^@/, '').toLowerCase() === myName));
-    const paysSelf = (input?.recipients ?? []).some(isMe) && !/\b(me|myself)\b/i.test(String(userText ?? ''));
-    if (paysSelf) { checkHold = 'self'; checkNotes.push(`-# ⚠️ This pays **you** (@${senderUser?.username ?? 'you'}), not someone you named. \`!cancel\` it and try again, picking the person from the @ list.`); }
-    const missing = dropGroundCheck({ ...input, recipients: (input?.recipients ?? []).filter((r) => !paysSelf || !isMe(r)) }, userText, mentionedUsers, preSrc)
-      .filter((m) => !(paysSelf && m === 'discord:' + senderId));
-    if (missing.length) { checkHold = checkHold ?? 'ungrounded'; checkNotes.push(`-# Not in your message: ${missing.join(', ')}`); }
+    const missing = dropGroundCheck(input, userText, mentionedUsers, preSrc);
+    if (missing.length) { checkHold = 'ungrounded'; checkNotes.push(`-# Not in your message: ${missing.join(', ')}`); }
     const cap = await capCheck(senderId, input, preSrc);
     preSrc.usd = cap.usd;
     if (cap.over) { checkHold = checkHold ?? 'cap'; checkNotes.push(`-# ${cap.over}`); }
@@ -2684,7 +2648,6 @@ async function handleMessage(message) {
       : '[User has NO personal Quidli API key — do NOT execute any drops. If they request a drop, tell them they must first DM me `!connect <your-api-key>` to link their Quidli account (get a key at connect.quid.li). Do not proceed with any token transfer.]';
   const now = new Date();
   const timeContext = `[Current date and time: ${now.toUTCString()} | Local ISO: ${now.toISOString()}]`;
-  const plainNames = await resolvePlainNames(message).catch(() => ({ users: [], note: '' }));
   // ── Documents ────────────────────────────────────────────────────────────────
   const docBlocks = [];
   for (const att of pdfAttachments) {
@@ -2713,7 +2676,7 @@ async function handleMessage(message) {
   const outcomeRecords = provider === 'minds' ? [] : heldOutcomeRecords.take(contextId);
   const contextualText =
     (outcomeRecords.length ? `${outcomeRecords.join('\n')}\n` : '') +
-    `${timeContext}\n[Sent by @${senderName} (Discord ID: ${message.author.id})] ${walletNote}${plainNames.note}\n`
+    `${timeContext}\n[Sent by @${senderName} (Discord ID: ${message.author.id})] ${walletNote}\n`
     + (replyContext ? `${replyContext}\n\n` : '')
     + neutraliseBotRecords(text)
     + (docBlocks.length ? `\n\n${docBlocks.join('\n\n')}` : '');
@@ -2732,7 +2695,7 @@ async function handleMessage(message) {
     senderApiKey,
     senderUser: message.author,
     userText: message.content,
-    mentionedUsers: [...[...(message.mentions?.users?.values?.() ?? [])].map((u) => ({ id: u.id, username: u.username, globalName: u.globalName ?? null })), ...plainNames.users],
+    mentionedUsers: [...(message.mentions?.users?.values?.() ?? [])].map((u) => ({ id: u.id, username: u.username, globalName: u.globalName ?? null })),
     currentChannelId: message.channelId,
     contextId,
     documentInContext,
@@ -2808,7 +2771,7 @@ async function handleMessage(message) {
             const pendingText = stripHtml(lastMindReply.messageText ?? '');
             if (age < 60 * 60 * 1000 && looksLikePendingAction(pendingText)) {
               handoffText =
-                `${timeContext}\n[Sent by @${senderName} (Discord ID: ${message.author.id})] ${walletNote}${plainNames.note}\n` +
+                `${timeContext}\n[Sent by @${senderName} (Discord ID: ${message.author.id})] ${walletNote}\n` +
                 `The user's Minds AI agent researched and prepared the following action plan. ` +
                 `The user has now confirmed it. Execute it immediately using your tools — no further confirmation needed:\n\n` +
                 `---\n${pendingText}\n---\n\n` +
@@ -3279,9 +3242,10 @@ client.once(Events.ClientReady, (c) => {
   } else {
     console.log('   Mode: respond when @mentioned');
   }
-  // Leave servers that are not allowed, then store the first allowed guild for role lookups
-  for (const g of c.guilds.cache.values()) leaveIfNotAllowed(g);
-  activeGuild = c.guilds.cache.find((g) => ALLOWED_GUILDS.size === 0 || ALLOWED_GUILDS.has(g.id)) ?? null;
+  // Leave any server not on the allowlist, then store the first allowed guild for role lookups
+  c.guilds.cache.forEach((g) => leaveIfNotAllowed(g));
+  if (ALLOWED_GUILDS.size > 0) console.log(`   Allowed guilds: ${[...ALLOWED_GUILDS].join(', ')}`);
+  activeGuild = c.guilds.cache.find((g) => guildAllowed(g.id)) ?? null;
   if (activeGuild) console.log(`   Guild: ${activeGuild.name}`);
   // Re-queue any scheduled drops that survived a restart
   loadPendingDrops();
@@ -3290,8 +3254,11 @@ client.once(Events.ClientReady, (c) => {
   registerMcpTools();
 });
 
+client.on(Events.GuildCreate, (guild) => { leaveIfNotAllowed(guild); });
+
 client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot) return;
+  if (message.guild && !guildAllowed(message.guild.id)) return;
   // !confirm / !cancel work in DMs and in any channel, mention or not. Codes
   // are bound to the requesting user, so nobody else can fire one.
   const confirmCmd = parseConfirmCommand(message.content, message.client.user?.id);
@@ -3336,8 +3303,6 @@ client.on(Events.MessageCreate, async (message) => {
 });
 
 // An 'error' event with no listener throws and takes the process down.
-client.on(Events.GuildCreate, (guild) => { leaveIfNotAllowed(guild); });
-
 client.on(Events.Error, (err) => console.error('[discord] client error:', err?.message ?? err));
 
 // Before this there were no signal handlers: pm2's SIGINT ended the process
