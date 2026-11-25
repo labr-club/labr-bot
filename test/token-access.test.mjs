@@ -39,7 +39,6 @@ test('config: off without ACCESS_TOKEN, strict when on', () => {
   assert.equal(cfg.chainId, 8453);
   assert.equal(cfg.rpcUrl, 'https://mainnet.base.org');
   assert.equal(cfg.role, 'Holder');
-  assert.deepEqual([...cfg.exemptRoles], ['Maintainer', 'Contributor']);
   assert.deepEqual(cfg.tiers, [{ held: '1000', perDay: 20 }], 'default: one tier at the minimum');
   assert.equal(cfg.recheckMs, 360 * 60_000);
 

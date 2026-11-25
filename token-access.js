@@ -28,7 +28,6 @@ export function parseUnits(value, decimals) {
  *   ACCESS_RPC_URL=https://...      JSON-RPC for that chain (default: Base public RPC)
  *   ACCESS_MIN=1000                 tokens a member must hold
  *   ACCESS_ROLE=Holder              role given to holders
- *   ACCESS_EXEMPT_ROLES=Maintainer,Contributor   keep access without holding
  *   ACCESS_AI_TIERS=1000:20,10000:100            held:AI messages per day (UTC)
  *   ACCESS_RECHECK_MIN=360          minutes between full member rechecks
  */
@@ -50,14 +49,12 @@ export function parseAccessConfig(env) {
   });
   const recheckMin = Number(env.ACCESS_RECHECK_MIN ?? 360);
   if (!(recheckMin >= 5)) throw new Error('ACCESS_RECHECK_MIN must be at least 5');
-  const list = (v) => String(v ?? '').split(',').map((s) => s.trim()).filter(Boolean);
   return {
     token: token.toLowerCase(),
     chainId,
     rpcUrl,
     min,
     role: String(env.ACCESS_ROLE ?? '').trim() || 'Holder',
-    exemptRoles: new Set(list(env.ACCESS_EXEMPT_ROLES ?? 'Maintainer,Contributor')),
     tiers,
     recheckMs: recheckMin * 60_000,
     cacheMs: 10 * 60_000,
