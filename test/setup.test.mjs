@@ -103,3 +103,77 @@ test('guilds the bot is in', async () => {
   assert.deepEqual(await botGuilds('t', async () => reply(200, [{ id: '1', name: 'S', icon: null }])), [{ id: '1', name: 'S' }]);
   assert.deepEqual(await botGuilds('t', async () => reply(401, {})), []);
 });
+
+import { checkOpenAICompatible, checkGemini, checkProvider, checkNous, PROVIDERS } from '../scripts/setup.mjs';
+
+test('providers: four choices, Anthropic first and marked recommended', () => {
+  assert.deepEqual(PROVIDERS.map((p) => p.id), ['anthropic', 'openai', 'gemini', 'hermes']);
+  assert.match(PROVIDERS[0].label, /recommended/);
+});
+
+test('OpenAI-compatible check: one-token request; bad key, no credit, wrong model, busy', async () => {
+  const cfg = { baseURL: 'https://x/v1', key: 'k', model: 'm', billing: 'https://bill' };
+  let sent;
+  assert.deepEqual(await checkOpenAICompatible(cfg, async (url, init) => { sent = { url, init }; return reply(200, {}); }), { ok: true });
+  assert.equal(sent.url, 'https://x/v1/chat/completions');
+  assert.equal(sent.init.headers.authorization, 'Bearer k');
+  assert.equal(JSON.parse(sent.init.body).max_tokens, 1);
+  assert.match((await checkOpenAICompatible(cfg, async () => reply(401, { error: { message: 'bad' } }))).why, /rejected/);
+  const broke = await checkOpenAICompatible(cfg, async () => reply(429, { error: { code: 'insufficient_quota', message: 'You exceeded your current quota' } }));
+  assert.equal(broke.noCredit, true);
+  assert.match(broke.why, /https:\/\/bill/);
+  assert.match((await checkOpenAICompatible(cfg, async () => reply(404, { error: { code: 'model_not_found', message: 'nope' } }))).why, /can't use m/);
+  assert.deepEqual(await checkOpenAICompatible(cfg, async () => reply(429, { error: { message: 'Rate limit reached' } })), { ok: true, busy: true });
+});
+
+test('Gemini check: picks a Flash model the key can use, then tries it', async () => {
+  const calls = [];
+  const fetchImpl = async (url, init = {}) => {
+    calls.push([init.method ?? 'GET', url.replace(/key=[^&]+/, 'key=K')]);
+    if (!init.method) return reply(200, { models: [
+      { name: 'models/gemini-2.5-pro', supportedGenerationMethods: ['generateContent'] },
+      { name: 'models/gemini-3.0-flash', supportedGenerationMethods: ['generateContent'] },
+      { name: 'models/text-embedding-004', supportedGenerationMethods: ['embedContent'] },
+    ] });
+    return reply(200, {});
+  };
+  assert.deepEqual(await checkGemini('K', undefined, fetchImpl), { ok: true, model: 'gemini-3.0-flash', busy: false });
+  assert.match(calls[1][1], /models\/gemini-3\.0-flash:generateContent/);
+  assert.equal((await checkGemini('K', 'gemini-2.5-pro', fetchImpl)).model, 'gemini-2.5-pro', 'a model already set is kept');
+  assert.match((await checkGemini('K', undefined, async () => reply(400, {}))).why, /rejected/);
+  assert.match((await checkGemini('K', undefined, async () => reply(200, { models: [] }))).why, /no Gemini model/);
+});
+
+test('checkProvider routes each provider to its API', async () => {
+  const seen = [];
+  const f = async (url) => {
+    seen.push(new URL(url).host);
+    return reply(200, {
+      models: [{ name: 'models/gemini-2.5-flash', supportedGenerationMethods: ['generateContent'] }],
+      data: [{ id: 'a/b:free', supported_parameters: ['tools'] }],
+      choices: [{ message: {} }],
+    });
+  };
+  for (const id of ['anthropic', 'openai', 'hermes', 'gemini']) assert.equal((await checkProvider(id, 'k', {}, f)).ok, true, id);
+  assert.deepEqual([...new Set(seen)], ['api.anthropic.com', 'api.openai.com', 'inference-api.nousresearch.com', 'generativelanguage.googleapis.com']);
+});
+
+test('Nous check: uses a live free model that answers a tool call, skipping ones that fail', async () => {
+  const tried = [];
+  const f = async (url, init = {}) => {
+    if (!init.method) return reply(200, { data: [
+      { id: 'old/gone', supported_parameters: ['tools'] },
+      { id: 'x/no-tools:free', supported_parameters: [] },
+      { id: 'y/broken:free', supported_parameters: ['tools'] },
+      { id: 'z/works:free', supported_parameters: ['tools'] },
+    ] });
+    const { model, tools } = JSON.parse(init.body);
+    tried.push(model);
+    assert.ok(tools?.length, 'probes with a tool');
+    return model === 'z/works:free' ? reply(200, { choices: [{ message: {} }] }) : reply(400, { message: 'missing tags' });
+  };
+  assert.deepEqual(await checkNous('k', 'retired/model:free', f), { ok: true, model: 'z/works:free' });
+  assert.deepEqual(tried, ['y/broken:free', 'z/works:free'], 'a retired preferred model and tool-less ones are skipped');
+  assert.match((await checkNous('k', undefined, async (u, i = {}) => (i.method ? reply(401, {}) : reply(200, { data: [{ id: 'z/w:free', supported_parameters: ['tools'] }] })))).why, /rejected/);
+  assert.match((await checkNous('k', undefined, async () => reply(200, { data: [] }))).why, /no free model/);
+});

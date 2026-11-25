@@ -224,6 +224,8 @@ function buildRunTool(overrides = {}) {
     summariseRound: (label) => `round ${label}`,
     payoutExecute: async () => { calls.push({ tool: 'payout' }); return { status: 'ok', executed: true }; },
     // Labr: runTool pays through the holder check; with token access off it is a pass-through.
+    // Labr: conditional drops need a host Claude key to check the condition.
+    anthropic: {},
     gatedPayoutExecute: async () => { calls.push({ tool: 'payout' }); return { status: 'ok', executed: true }; },
     payoutProposal: async () => ({ status: 'ok', label: 'dc-demo-1', proposal: '@alice — 100 BNKR (100.00%)' }),
     mcpToolNames: new Set(['connect_drop']),

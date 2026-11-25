@@ -89,7 +89,7 @@ const {
   //
   // Paid tiers can use any of the 200+ slugs (anthropic/claude-sonnet-4.6, etc).
   // Users can override per-channel with: !llm hermes <key> <model>
-  NOUS_MODEL = 'poolside/laguna-s-2.1:free',
+  NOUS_MODEL = 'tencent/hy4-flash:free',
   REQUIRE_USER_LLM_KEY = 'false', // Legacy — host keys are now owner/allowlist-only regardless
   // Who may spend the HOST's LLM keys. The owner always can. Everyone else must
   // either be listed here (handle or numeric ID), hold a role in
@@ -109,7 +109,18 @@ const REQUIRE_USER_LLM = REQUIRE_USER_LLM_KEY === 'true';
 // A missing key stops the bot with one line that says what to do, not a stack trace.
 {
   const unset = (v) => !v || /^your_.*_here$/.test(String(v).trim());
-  const missing = [['DISCORD_TOKEN', DISCORD_TOKEN], ['ANTHROPIC_API_KEY', ANTHROPIC_API_KEY]].filter(([, v]) => unset(v)).map(([k]) => k);
+  // The host needs a key for whichever AI provider it runs on by default.
+  const providerKey = {
+    anthropic: ['ANTHROPIC_API_KEY', ANTHROPIC_API_KEY],
+    openai: ['OPENAI_API_KEY', OPENAI_API_KEY],
+    gemini: ['GEMINI_API_KEY', GEMINI_API_KEY],
+    hermes: ['NOUS_API_KEY', NOUS_API_KEY],
+  }[DEFAULT_LLM_PROVIDER];
+  if (!providerKey) {
+    console.error(`\nDEFAULT_LLM_PROVIDER is "${DEFAULT_LLM_PROVIDER}". Use anthropic, openai, gemini or hermes, or run \`npm run setup\`.\n`);
+    process.exit(1);
+  }
+  const missing = [['DISCORD_TOKEN', DISCORD_TOKEN], providerKey].filter(([, v]) => unset(v)).map(([k]) => k);
   if (missing.length) {
     console.error(`\n${missing.join(' and ')} ${missing.length > 1 ? 'are' : 'is'} not set. Run \`npm run setup\` to set the bot up.\n`);
     process.exit(1);
@@ -664,6 +675,7 @@ async function executeConditionalDrop(jobId) {
     let conditionMet = false;
 
     for (let i = 0; i < 5; i++) {
+      if (!anthropic) throw new Error('no Anthropic key on this bot to check the condition');
       const evalRes = await anthropic.messages.create({
         model: CLAUDE_MODEL,
         max_tokens: 1024,
@@ -2061,6 +2073,7 @@ async function runTool(name, input, {
       }
       return JSON.stringify({ error: 'No Quidli API key connected. Sent a DM with setup instructions.' });
     }
+    if (!anthropic) return JSON.stringify({ error: 'Conditional drops need ANTHROPIC_API_KEY on this bot: the condition is checked by Claude. Nothing was scheduled.' });
     const { condition, checkAt, ...dropParams } = input;
     const checkAtMs = new Date(checkAt).getTime();
     if (isNaN(checkAtMs)) return JSON.stringify({ error: 'Invalid checkAt timestamp. Provide an ISO 8601 UTC string, e.g. "2026-06-27T22:30:00Z".' });
@@ -2196,10 +2209,12 @@ async function runTool(name, input, {
 // Model calls give up after 2 min and retry once, instead of the SDK default
 // of 10 min × 3 tries — a stalled provider left "Thinking…" up for ages.
 const LLM_TIMEOUT = { timeout: 120_000, maxRetries: 1 };
-const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY, ...LLM_TIMEOUT });
+// Only when the host has an Anthropic key: a bot can run on another provider.
+const anthropic = ANTHROPIC_API_KEY ? new Anthropic({ apiKey: ANTHROPIC_API_KEY, ...LLM_TIMEOUT }) : null;
 
 function getAnthropicClient(userApiKey) {
   if (userApiKey) return new Anthropic({ apiKey: userApiKey, ...LLM_TIMEOUT });
+  if (!anthropic) throw new Error(`This bot has no Claude key. DM me \`!llm anthropic <key>\` to use your own, or say "switch to ${DEFAULT_LLM_PROVIDER}".`);
   return anthropic;
 }
 
@@ -3089,7 +3104,7 @@ async function handleDM(message) {
         '  Example: `!llm openrouter sk-or-... meta-llama/llama-3-70b-instruct`\n' +
         '  Default model: openai/gpt-4o\n' +
         '  `!llm hermes <key> [model]`\n' +
-        '  Example: `!llm hermes sk-... poolside/laguna-s-2.1:free`  (free tier)\n' +
+        '  Example: `!llm hermes sk-... tencent/hy4-flash:free`  (free tier)\n' +
         '  Nous Portal proxies 200+ models — see portal.nousresearch.com/info\n\n' +
         'Your key is stored encrypted and used instead of the host key. DM `!llm-remove` to disconnect.'
       );
@@ -3320,6 +3335,7 @@ const client = new Client({
 client.once(Events.ClientReady, (c) => {
   const defaultModel = DEFAULT_LLM_PROVIDER === 'gemini' ? GEMINI_MODEL
     : DEFAULT_LLM_PROVIDER === 'openai' ? OPENAI_MODEL
+    : DEFAULT_LLM_PROVIDER === 'hermes' ? NOUS_MODEL
     : CLAUDE_MODEL;
   console.log(`✅ Labr ready, logged in as ${c.user.tag}`);
   console.log(`   Default LLM: ${DEFAULT_LLM_PROVIDER} (${defaultModel})`);
@@ -3328,6 +3344,19 @@ client.once(Events.ClientReady, (c) => {
   if (GEMINI_API_KEY) console.log(`   Gemini: ${GEMINI_MODEL} ✓`);
   if (OPENAI_API_KEY) console.log(`   OpenAI: ${OPENAI_MODEL} ✓`);
   if (NOUS_API_KEY) console.log(`   Hermes: ${NOUS_MODEL} ✓ (via Nous Portal — 200+ models, per-user override with !llm hermes <key> <model>)`);
+  // Nous retires free models without notice; say so at startup instead of
+  // failing on the first message in Hermes mode.
+  if (NOUS_API_KEY) {
+    fetch('https://inference-api.nousresearch.com/v1/models', { signal: AbortSignal.timeout(10_000) })
+      .then((r) => r.json())
+      .then((body) => {
+        const models = body?.data ?? [];
+        if (!models.length || models.some((m) => m.id === NOUS_MODEL)) return;
+        const free = models.filter((m) => m.id.endsWith(':free') && (m.supported_parameters ?? []).includes('tools')).map((m) => m.id);
+        console.warn(`⚠️  NOUS_MODEL ${NOUS_MODEL} no longer exists on Nous Portal, so Hermes mode will fail. Free models with tools today: ${free.join(', ') || 'none'}. Set NOUS_MODEL in .env.`);
+      })
+      .catch(() => {});
+  }
   console.log(`   Quidli: ${QUIDLI_API_KEY ? 'API key' : 'x402 payments'}`);
   console.log(`   Bankr: per-user keys (DM !bankr <key>)${BANKR_API_KEY ? ' + owner host key' : ''}`);
   console.log(`   Key storage: ${encKey ? 'encrypted (AES-256-GCM)' : '⚠️  plaintext — set MASTER_ENCRYPTION_KEY to encrypt'}`);

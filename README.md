@@ -20,7 +20,7 @@ npm run setup
 Setup asks for three keys and checks each one as you go:
 
 1. **Discord bot token.** At [discord.com/developers/applications](https://discord.com/developers/applications): New Application, then Bot, then Reset Token. Setup turns on the permissions the bot needs and finds your Discord user ID for you.
-2. **Anthropic API key**, from [console.anthropic.com](https://console.anthropic.com).
+2. **An AI key.** Pick a provider: Anthropic (recommended, Labr is tuned for Claude), OpenAI, Google Gemini or Nous Portal (has a free tier). Setup checks the key with a tiny real request, so a key without credit is caught before the bot starts.
 3. **Quidli Connect API key**, from [connect.quid.li](https://connect.quid.li). Turn on Smart Send there and fund the wallet setup shows you with what you'll pay out.
 
 Then it prints an invite link. Add the bot to your server, setup sees it join, and starts Labr. Your keys stay in `.env` on your machine.
