@@ -28,6 +28,7 @@ said the treasury "funds bounties".
 | Chains | Chain names in bot-written lines come from Connect at startup, with a built-in fallback. |
 | Prompt | `SYSTEM_PROMPT_FILE=labr-prompt.txt`: the prompt lives in this repo, not inline in `.env`. |
 | Payout approval | `!confirm` by default. World ID is opt-in with `PAYOUT_APPROVAL=world_id`. |
+| No Minds | The Minds (Animoca Brands) provider is removed: no `!minds` commands, no "switch to minds", no `@animocabrands/minds-client-lib` dependency. The unused `minds_*` columns stay in `users.db`. |
 
 ## Not covered
 

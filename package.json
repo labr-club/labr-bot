@@ -13,7 +13,6 @@
     "check": "node --check bot.js && node --test"
   },
   "dependencies": {
-    "@animocabrands/minds-client-lib": "^0.1.0",
     "@anthropic-ai/sdk": "^0.39.0",
     "@google/genai": "^1.0.0",
     "discord.js": "^14.15.3",

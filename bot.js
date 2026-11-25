@@ -10,8 +10,7 @@
 import 'dotenv/config';
 import Anthropic from '@anthropic-ai/sdk';
 import { DatabaseSync } from 'node:sqlite';
-import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
-import { createMindsClient, isReplyHistoryRow } from '@animocabrands/minds-client-lib';
+import { createCipheriv, createDecipheriv } from 'node:crypto';
 import {
   Client,
   GatewayIntentBits,
@@ -66,7 +65,7 @@ const {
   BOT_OWNER_ID,                 // Discord user ID of the bot owner — uses host QUIDLI_API_KEY for drops automatically
   BRAVE_SEARCH_API_KEY,         // Brave Search API key for web search tool
   // Multi-LLM provider support
-  DEFAULT_LLM_PROVIDER = 'anthropic', // anthropic | gemini | openai | minds
+  DEFAULT_LLM_PROVIDER = 'anthropic', // anthropic | gemini | openai | openrouter | hermes
   GEMINI_API_KEY,
   GEMINI_MODEL = 'gemini-2.0-flash',
   OPENAI_API_KEY,
@@ -93,7 +92,6 @@ const {
   // HOST_KEY_ALLOWED_ROLES, or connect their own key for the provider in use.
   HOST_KEY_ALLOWED_USERS = '',
   HOST_KEY_ALLOWED_ROLES = '',
-  // Minds (Animoca Brands) — per-user credentials registered via DM: !minds <key> [mind-name]
 } = process.env;
 
 // Nous Portal is OpenAI-compatible — reuses runOpenAILoop with a custom baseURL,
@@ -138,7 +136,7 @@ const HOST_KEY_ROLES = new Set(
 );
 
 // Providers that would otherwise silently fall back to a host key.
-// 'openrouter' and 'minds' are per-user by design and never touch host credentials.
+// 'openrouter' is per-user by design and never touch host credentials.
 const HOST_KEY_PROVIDERS = new Set(['anthropic', 'gemini', 'openai', 'hermes']);
 
 function mayUseHostKey(userId, username, member) {
@@ -475,36 +473,6 @@ function deleteUserLlmKey(discordId, provider) {
   }
   // Clear legacy columns so the migration doesn't resurrect removed keys
   db.prepare('UPDATE user_keys SET llm_provider = NULL, llm_api_key = NULL, llm_model = NULL WHERE discord_id = ?').run(discordId);
-}
-
-function getUserMindsCredentials(discordId) {
-  const row = db.prepare('SELECT minds_alias, minds_api_key, minds_name, minds_mind_id, minds_alias_created_at FROM user_keys WHERE discord_id = ?').get(discordId);
-  if (!row?.minds_alias || !row?.minds_api_key) return null;
-  const apiKey = decrypt(row.minds_api_key);
-  if (!apiKey) return null;
-  return {
-    alias: row.minds_alias,
-    apiKey,
-    name: row.minds_name ?? 'Minds',
-    mindId: row.minds_mind_id ?? null,
-    aliasCreatedAt: row.minds_alias_created_at ?? null,
-  };
-}
-
-function setUserMindsCredentials(discordId, apiKey, alias, mindName, mindId) {
-  db.prepare(`INSERT INTO user_keys (discord_id, api_key, minds_alias, minds_api_key, minds_name, minds_mind_id, minds_alias_created_at)
-    VALUES (?, '', ?, ?, ?, ?, unixepoch())
-    ON CONFLICT(discord_id) DO UPDATE SET
-      minds_alias = excluded.minds_alias,
-      minds_api_key = excluded.minds_api_key,
-      minds_name = excluded.minds_name,
-      minds_mind_id = excluded.minds_mind_id,
-      minds_alias_created_at = excluded.minds_alias_created_at`)
-    .run(discordId, alias, encrypt(apiKey), mindName ?? null, mindId ?? null);
-}
-
-function deleteUserMindsCredentials(discordId) {
-  db.prepare('UPDATE user_keys SET minds_alias = NULL, minds_api_key = NULL, minds_name = NULL, minds_mind_id = NULL, minds_alias_created_at = NULL WHERE discord_id = ?').run(discordId);
 }
 
 // ─── Scheduled drops ─────────────────────────────────────────────────────────
@@ -2164,8 +2132,6 @@ function detectProviderSwitch(text) {
   if (/\b(claude|fable|opus|haiku|sonnet)\s+mode\b/.test(lower)) return 'anthropic';
   if (/\b(openrouter|kimi|llama|mistral|deepseek)\s+mode\b/.test(lower)) return 'openrouter';
   if (/\b(hermes|nous)\s+mode\b/.test(lower)) return 'hermes';
-  if (/(switch|change|use|swap)\s+(to\s+)?minds/.test(lower)) return 'minds';
-  if (/\bminds\s+mode\b/.test(lower)) return 'minds';
   return null;
 }
 
@@ -2225,26 +2191,6 @@ const documentTaint = createDocumentTaint({ turns: MAX_HISTORY });
 // connect_drop schema — but that makes the hazard worse, not better: nothing dedupes.)
 // Longest legitimate chain is ~10 (lookup retries → drop), so 25 leaves headroom.
 const MAX_TOOL_ROUNDS = 25;
-
-// Minds responses often use HTML — strip to plain text before passing to Claude
-function stripHtml(text) {
-  return text.replace(/<br\s*\/?>/gi, '\n').replace(/<[^>]+>/g, '');
-}
-
-// True if the Mind's response contains a resolved wallet address and either action language or an amount
-function looksLikePendingAction(text) {
-  const hasWallet = /0x[0-9a-fA-F]{40}/i.test(text);
-  const hasActionLanguage = /\b(confirm|fire it?|proceed|approve|go ahead|ready to|shall i|execute|let me know|either path|two paths?|two options?|option \d|queued|send is|drop is)\b/i.test(text);
-  const hasAmount = /\b(usdc|usdt|wei|eth)\b/i.test(text);
-  return hasWallet && (hasActionLanguage || hasAmount);
-}
-
-// True if the user's message is a positive confirmation
-function isPositiveConfirmation(text) {
-  const t = text.trim().toLowerCase();
-  if (t.length > 120) return false;
-  return /\b(yes|yep|yup|yeah|go|do it|fire it|fire|confirm(ed)?|sure|ok(ay)?|proceed|send it|send now|execute|approved?|absolutely|👍|✅|correct|affirmative|let'?s go|go ahead|sounds good|looks good|perfect|please do|go for it|make it so|just send|send it now|do it now|go for it|just do it)\b/i.test(t);
-}
 
 function getAnthropicHistory(contextId) {
   if (!anthropicHistories.has(contextId)) anthropicHistories.set(contextId, []);
@@ -2482,91 +2428,6 @@ async function runOpenAILoop(contextId, contextualText, editor, toolCtx, userLlm
   return accumulated;
 }
 
-const MINDS_ALIAS_MAX_AGE_S = 4 * 60 * 60; // rotate conversation thread every 4 hours
-
-// Async fire-and-forget Minds handler. Sends the message, updates Discord when the reply arrives.
-// Not awaited from handleMessage — returns immediately so Discord stays responsive.
-async function runMindsBackground(contextId, text, replyMsg, senderId, mindName) {
-  let creds = getUserMindsCredentials(senderId);
-  if (!creds) {
-    await replyMsg.edit(
-      '⚠️ You need to connect your Minds agent.\n' +
-      'DM me `!minds <builder-api-key>` to connect.\n' +
-      'Get a Builder API key at https://build.hellominds.ai/console'
-    ).catch(() => {});
-    return;
-  }
-
-  // Rotate alias if older than 4 hours to prevent Minds falling back to email
-  if (creds.mindId && creds.aliasCreatedAt) {
-    const ageS = Math.floor(Date.now() / 1000) - creds.aliasCreatedAt;
-    if (ageS > MINDS_ALIAS_MAX_AGE_S) {
-      try {
-        const rotateClient = createMindsClient({ builderApiKey: creds.apiKey });
-        const newAlias = `dc${senderId.slice(-8)}${randomBytes(2).toString('hex')}`;
-        await rotateClient.ensureConversation(newAlias, creds.mindId);
-        setUserMindsCredentials(senderId, creds.apiKey, newAlias, creds.name, creds.mindId);
-        creds = getUserMindsCredentials(senderId);
-        console.log(`[minds] Rotated alias for ${senderId} → ${newAlias}`);
-      } catch (err) {
-        console.error('[minds-rotate] failed:', err.message);
-        // Continue with old alias rather than failing
-      }
-    }
-  }
-
-  const { alias, apiKey } = creds;
-  const userText = text.replace(/^\[Current date.*?\]\n\[Sent by.*?\]\s*/s, '').trim();
-  const mindsClient = createMindsClient({ builderApiKey: apiKey });
-
-  let afterFingerprint;
-  try {
-    afterFingerprint = await mindsClient.getLatestHistoryFingerprint(alias);
-  } catch { /* first message */ }
-
-  try {
-    await mindsClient.sendMessage({ alias, messageText: userText });
-  } catch (err) {
-    await replyMsg.edit(`⚠️ Failed to send to Minds: ${err.message.slice(0, 200)}`).catch(() => {});
-    return;
-  }
-
-  await replyMsg.edit('⏳ Sent to your Mind…').catch(() => {});
-
-  try {
-    const outcome = await mindsClient.waitForReply({
-      alias,
-      timeoutMs: 300000, // 5 minutes
-      sentMessageText: userText,
-      ...(afterFingerprint !== undefined ? { afterFingerprint } : {}),
-    });
-
-    let responseText;
-    if (outcome.timedOut) {
-      responseText = '⏳ Your Mind is taking longer than expected. Check with `minds history discord` or try again.';
-    } else {
-      responseText = stripHtml(outcome.reply?.messageText || '_(no response)_');
-    }
-
-    const finalText = responseText + `\n-# Minds (${mindName})`;
-    const chunks = chunkText(finalText);
-    await replyMsg.edit(chunks[0] ?? '…').catch(() => {});
-    for (let i = 1; i < chunks.length; i++) {
-      await replyMsg.channel.send(chunks[i]).catch(() => {});
-    }
-  } catch (err) {
-    console.error('[minds-bg] error:', err.message);
-    if (/alias.*not found/i.test(err.message)) {
-      await replyMsg.edit(
-        '⚠️ Your Minds alias is no longer valid.\n' +
-        'DM me `!minds <builder-api-key>` to reconnect.'
-      ).catch(() => {});
-    } else {
-      await replyMsg.edit(`⚠️ Minds error: ${err.message.slice(0, 200)}`).catch(() => {});
-    }
-  }
-}
-
 // ─── Discord helpers ──────────────────────────────────────────────────────────
 
 function chunkText(text, limit = DISCORD_MSG_LIMIT) {
@@ -2665,7 +2526,7 @@ async function handleMessage(message) {
   // The host's LLM keys are spendable only by the owner or explicitly authorized
   // handles/roles. Everyone else must have their own key FOR THE PROVIDER IN USE —
   // a Gemini key must not unlock the host's Nous key. Providers outside
-  // HOST_KEY_PROVIDERS (openrouter, minds) are per-user already and never reach here.
+  // HOST_KEY_PROVIDERS (openrouter) are per-user already and never reach here.
   const activeProvider = detectProviderSwitch(message.content) ?? getChannelProvider(message.channelId);
   // An OpenRouter key also counts for 'anthropic' — the branch below deliberately
   // routes Claude through OpenRouter on the user's own credits in that case.
@@ -2788,20 +2649,12 @@ async function handleMessage(message) {
     const modelName = switchTarget === 'gemini' ? GEMINI_MODEL
       : switchTarget === 'openai' ? OPENAI_MODEL
       : switchTarget === 'hermes' ? NOUS_MODEL
-      : switchTarget === 'minds' ? 'Minds'
       : (namedModel || CLAUDE_MODEL);
     await message.reply(`🔀 Switched to **${modelName}**. Starting a fresh conversation.`).catch(() => {});
     return;
   }
 
   const provider = getChannelProvider(contextId);
-
-  // Minds is a text relay to a separate runtime — it gets no tools and no
-  // history here, so there's nowhere safe to put a document.
-  if (pdfAttachments.length && provider === 'minds') {
-    await message.reply('📄 PDFs aren\'t supported in Minds mode yet. Say "switch to claude" (or another provider) and send it again.').catch(() => {});
-    return;
-  }
 
   const replyMsg = await message.reply(pdfAttachments.length ? '_Reading document…_' : '_Thinking…_').catch((err) => {
     console.error('[discord] reply failed:', err.message);
@@ -2842,12 +2695,11 @@ async function handleMessage(message) {
     }
   }
 
-  // Results of !confirm / !cancel since the last turn. Minds turns are relayed
-  // as plain text to another runtime, so records wait for a non-Minds turn.
+  // Results of !confirm / !cancel since the last turn.
   // Who wrote the message being replied to — without this, "is this my
   // co-founder?" as a reply has no subject.
   const replyContext = formatReplyContext(repliedTo, botId);
-  const outcomeRecords = provider === 'minds' ? [] : heldOutcomeRecords.take(contextId);
+  const outcomeRecords = heldOutcomeRecords.take(contextId);
   const contextualText =
     (outcomeRecords.length ? `${outcomeRecords.join('\n')}\n` : '') +
     `${timeContext}\n[Sent by @${senderName} (Discord ID: ${message.author.id})] ${walletNote}${plainNames.note}\n`
@@ -2929,55 +2781,6 @@ async function handleMessage(message) {
         model: hermesModel,
       });
       modelLabel = hermesModel;
-    } else if (effectiveProvider === 'minds') {
-      const creds = getUserMindsCredentials(message.author.id);
-      const mindName = creds?.name ?? 'unknown';
-
-      // If this looks like a confirmation, re-fetch Minds history to check for a pending action.
-      // Using getHistory instead of in-memory state so handoffs survive bot restarts.
-      let handoffText = null;
-      if (creds && isPositiveConfirmation(text)) {
-        try {
-          const mindsClient = createMindsClient({ builderApiKey: creds.apiKey });
-          const history = await mindsClient.getHistory(creds.alias, { limit: 10 });
-          const lastMindReply = history.findLast((row) => isReplyHistoryRow(row));
-          if (lastMindReply) {
-            const age = Date.now() - new Date(lastMindReply.createdAt).getTime();
-            const pendingText = stripHtml(lastMindReply.messageText ?? '');
-            if (age < 60 * 60 * 1000 && looksLikePendingAction(pendingText)) {
-              handoffText =
-                `${timeContext}\n[Sent by @${senderName} (Discord ID: ${message.author.id})] ${walletNote}${plainNames.note}\n` +
-                `The user's Minds AI agent researched and prepared the following action plan. ` +
-                `The user has now confirmed it. Execute it immediately using your tools — no further confirmation needed:\n\n` +
-                `---\n${pendingText}\n---\n\n` +
-                `User confirmed: "${text}"`;
-            }
-          }
-        } catch (err) {
-          console.error('[minds-history] error:', err.message);
-          await replyMsg.edit('⚠️ Could not verify pending action — please try again.').catch(() => {});
-          return;
-        }
-      }
-
-      if (handoffText) {
-        // Minds itself is per-user, but executing a confirmed plan hands off to Claude —
-        // which would otherwise fall back to the HOST's Anthropic key. Gate it the same way.
-        if (!anthKey && !mayUseHostKey(message.author.id, message.author.username, message.member)) {
-          await editor.finalize(
-            '🔐 Executing this needs Claude, and you\'re not authorized to use the host\'s key.\n\n' +
-            'DM me `!llm anthropic <key>` to connect your own, or ask the bot owner to authorize you.'
-          );
-          return;
-        }
-        accumulated = await runAnthropicLoop(contextId, handoffText, editor, toolCtx, anthKey?.apiKey ?? null);
-        modelLabel = `${CLAUDE_MODEL} (via Minds)`;
-      } else {
-        // Async path — fire and forget, background function edits the reply when Mind responds
-        runMindsBackground(contextId, contextualText, replyMsg, message.author.id, mindName)
-          .catch((err) => console.error('[minds-bg] unhandled:', err.message));
-        return;
-      }
     } else {
       // anthropic (default). BYOLLM users without an Anthropic key but with an
       // OpenRouter key get Claude routed through OpenRouter on their own credits.
@@ -3022,7 +2825,7 @@ async function handleMessage(message) {
       const h = getOpenAIHistory(contextId);
       if (h.at(-1)?.role === 'user') h.pop();
     } else {
-      // anthropic or minds-handoff-to-claude
+      // anthropic
       const h = getAnthropicHistory(contextId);
       if (h.at(-1)?.role === 'user') h.pop();
     }
@@ -3091,65 +2894,6 @@ async function handleDM(message) {
     return;
   }
 
-  if (content.startsWith('!minds ')) {
-    const parts = content.slice('!minds '.length).trim().split(/\s+/);
-    const apiKey = parts[0];
-    const mindName = parts[1] || null;
-
-    if (!apiKey) {
-      await message.reply(
-        'Usage:\n' +
-        '`!minds <builder-api-key>` — connect your first enabled Mind\n' +
-        '`!minds <builder-api-key> <mind-name>` — connect a specific Mind\n\n' +
-        'Get a Builder API key at https://build.hellominds.ai/console'
-      );
-      return;
-    }
-
-    try {
-      const client = createMindsClient({ builderApiKey: apiKey });
-      const minds = await client.listMinds();
-      const enabledMinds = minds.filter((m) => m.isEnabled);
-
-      if (enabledMinds.length === 0) {
-        await message.reply('❌ No enabled Minds found on your account. Visit https://build.hellominds.ai to set one up.');
-        return;
-      }
-
-      let selectedMind;
-      if (mindName) {
-        selectedMind = enabledMinds.find((m) => m.name.toLowerCase() === mindName.toLowerCase());
-        if (!selectedMind) {
-          const names = enabledMinds.map((m) => `\`${m.name}\``).join(', ');
-          await message.reply(`❌ Mind \`${mindName}\` not found or not enabled.\nYour enabled Minds: ${names}`);
-          return;
-        }
-      } else {
-        selectedMind = enabledMinds[0];
-      }
-
-      const userAlias = `dc${message.author.id.slice(-8)}${randomBytes(2).toString('hex')}`;
-      await client.ensureConversation(userAlias, selectedMind.mindId);
-      setUserMindsCredentials(message.author.id, apiKey, userAlias, selectedMind.name, selectedMind.mindId);
-
-      const otherMinds = enabledMinds.filter((m) => m.mindId !== selectedMind.mindId);
-      const switchHint = otherMinds.length > 0
-        ? `\n\nTo use a different Mind: \`!minds <key> <mind-name>\`\nYour other enabled Minds: ${otherMinds.map((m) => `\`${m.name}\``).join(', ')}`
-        : '';
-
-      await message.reply(`✅ Connected to your **${selectedMind.name}** Mind. When the channel is in Minds mode, your messages will go to this Mind.${switchHint}`);
-    } catch (err) {
-      await message.reply(`❌ Failed to connect: ${err.message}`);
-    }
-    return;
-  }
-
-  if (content === '!minds-remove') {
-    deleteUserMindsCredentials(message.author.id);
-    await message.reply('🗑️ Your Minds credentials have been removed.');
-    return;
-  }
-
   if (content.startsWith('!llm ')) {
     const parts = content.slice('!llm '.length).trim().split(/\s+/);
     const provider = parts[0]?.toLowerCase();
@@ -3213,9 +2957,6 @@ async function handleDM(message) {
       '`!bankr-remove` — remove your Bankr key\n' +
       '`!llm <provider> <api-key>` — bring your own LLM key (anthropic, gemini, openai, openrouter for 100+ models, or hermes)\n' +
       '`!llm-remove` — remove your LLM key\n' +
-      '`!minds <builder-api-key>` — connect your Minds agent (key from https://build.hellominds.ai/console)\n' +
-      '`!minds <builder-api-key> <mind-name>` — connect a specific Mind if you have more than one\n' +
-      '`!minds-remove` — remove your Minds credentials\n' +
       '`!confirm <code>` / `!cancel <code>` — run or drop a transfer held for confirmation (`!confirm` alone lists them)\n\n' +
       '📄 Attach a PDF (up to 3, 10 MB each, text-based) and I\'ll read it. While a document is in the conversation, any transfer I start waits for your `!confirm`.\n\n' +
       'Get a Quidli API key at https://connect.quid.li'
@@ -3411,7 +3152,6 @@ client.once(Events.ClientReady, (c) => {
   if (GEMINI_API_KEY) console.log(`   Gemini: ${GEMINI_MODEL} ✓`);
   if (OPENAI_API_KEY) console.log(`   OpenAI: ${OPENAI_MODEL} ✓`);
   if (NOUS_API_KEY) console.log(`   Hermes: ${NOUS_MODEL} ✓ (via Nous Portal — 200+ models, per-user override with !llm hermes <key> <model>)`);
-  console.log(`   Minds: per-user keys (DM !minds <key> to register)`);
   console.log(`   Quidli: ${QUIDLI_API_KEY ? 'API key' : 'x402 payments'}`);
   console.log(`   Bankr: per-user keys (DM !bankr <key>)${BANKR_API_KEY ? ' + owner host key' : ''}`);
   console.log(`   Key storage: ${encKey ? 'encrypted (AES-256-GCM)' : '⚠️  plaintext — set MASTER_ENCRYPTION_KEY to encrypt'}`);
