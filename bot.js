@@ -1520,13 +1520,17 @@ async function resolvePlainNames(message) {
   const botName = String(message.client?.user?.username ?? '').toLowerCase();
   const names = [...new Set([...text.matchAll(/(?:^|[^\w@])@([\w.\-]{2,32})/g)].map((m) => m[1].replace(/[.\-]+$/, '')))]
     .filter((n) => n.length > 1 && !['everyone', 'here'].includes(n.toLowerCase()) && n.toLowerCase() !== botName);
-  if (!names.length || !message.guild) return { users: [], note: '' };
+  // In a DM there is no server on the message: use the bot's server, and only
+  // for someone who is a member of it.
+  const guild = message.guild ?? activeGuild;
+  if (!names.length || !guild) return { users: [], note: '' };
   try { await ensureMembersFetched(); } catch { return { users: [], note: '' }; }
+  if (!message.guild && !guild.members.cache.has(message.author.id)) return { users: [], note: '' };
   const users = [];
   const lines = [];
   for (const n of names.slice(0, 10)) {
     const q = n.toLowerCase();
-    const hits = message.guild.members.cache.filter((m) => !m.user.bot
+    const hits = guild.members.cache.filter((m) => !m.user.bot
       && [m.user.username, m.user.globalName, m.displayName, m.nickname].filter(Boolean).some((x) => String(x).toLowerCase() === q));
     if (hits.size === 1) {
       const m = hits.first();
@@ -2330,6 +2334,14 @@ const documentTaint = createDocumentTaint({ turns: MAX_HISTORY });
 // Longest legitimate chain is ~10 (lookup retries → drop), so 25 leaves headroom.
 const MAX_TOOL_ROUNDS = 25;
 
+// Text from separate model rounds (before and after a tool call) is joined with
+// a blank line; without it "…first." and "No linked…" ran together.
+function joinText(acc, next) {
+  if (!next) return acc;
+  if (!acc || /\s$/.test(acc) || /^\s/.test(next)) return acc + next;
+  return `${acc}\n\n${next}`;
+}
+
 function getAnthropicHistory(contextId) {
   if (!anthropicHistories.has(contextId)) anthropicHistories.set(contextId, []);
   return anthropicHistories.get(contextId);
@@ -2392,7 +2404,7 @@ async function runAnthropicLoop(contextId, contextualText, editor, toolCtx, user
 
     for (const block of response.content) {
       if (block.type === 'text') {
-        accumulated += block.text;
+        accumulated = joinText(accumulated, block.text);
         editor.update(accumulated || '_Thinking…_');
       }
     }
@@ -2450,7 +2462,7 @@ async function runGeminiLoop(contextId, contextualText, editor, toolCtx, userLlm
 
     for (const part of parts) {
       if (part.text) {
-        accumulated += part.text;
+        accumulated = joinText(accumulated, part.text);
         editor.update(accumulated || '_Thinking…_');
       }
     }
@@ -2516,7 +2528,7 @@ async function runOpenAILoop(contextId, contextualText, editor, toolCtx, userLlm
     const msg = choice.message;
 
     if (msg.content) {
-      accumulated += msg.content;
+      accumulated = joinText(accumulated, msg.content);
       editor.update(accumulated || '_Thinking…_');
     }
 
