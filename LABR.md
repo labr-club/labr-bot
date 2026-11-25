@@ -36,7 +36,7 @@ Off unless `ACCESS_TOKEN` is set (see `.env.example`). One token, three unlocks:
 
 | Unlock | How |
 |---|---|
-| The server | Holders get `ACCESS_ROLE` (default `Holder`); Discord channel permissions do the rest. Checked on join, on `!verify`, and for every member every `ACCESS_RECHECK_MIN` (default 6 h). A failed check (Connect or the RPC down) changes nothing. |
+| The server | Holders get `ACCESS_ROLE` (default `Holder`); Discord channel permissions do the rest. Checked on join, on `!verify`, and for every member every `ACCESS_RECHECK_MIN` (default 6 h). A failed check (Connect or the RPC down) changes nothing. `!verify` never shows a wallet in a channel (linked wallets are private in Connect); the details go by DM. |
 | Shared AI key | The holder role counts as a host-key role. Members who have it and nothing else (not the owner, not in `HOST_KEY_ALLOWED_USERS`, no role in `HOST_KEY_ALLOWED_ROLES`) get `ACCESS_AI_TIERS` messages per UTC day, by how much they hold. Counts live in `users.db` (`ai_usage`). |
 | Treasury payouts | Right before a payout runs, every contributor it pays must hold the minimum on the wallet their GitHub resolves to. Otherwise nothing is paid and the bot names who to leave out. The payout tool takes `exclude` (GitHub usernames the user wrote) for the re-run. |
 

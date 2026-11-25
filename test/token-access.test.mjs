@@ -224,3 +224,43 @@ test('payout holder check: pays only when every paid contributor holds; off mean
   assert.match((await make(['alice', 'bob'], { fail: 'bob' }).gatedPayoutExecute({ label: 'r' })).error, /could not check @bob/, 'a failed check pays nobody');
   assert.equal((await make([], { on: false }).gatedPayoutExecute({ label: 'r' })).status, 'ok', 'access off: unchanged');
 });
+
+test('!verify never posts a wallet in a channel; the details go by DM', async () => {
+  const W = '0x' + '33'.repeat(20);
+  const make = (holder) => build(['handleVerify'], {
+    ACCESS: { min: '1000', role: 'Holder', token: '0x' + 'ab'.repeat(20) },
+    tokenAccess: { isReady: true, symbol: 'LABR' },
+    activeGuild: { members: { fetch: async () => ({ id: 'u' }) } },
+    syncAccess: async () => ({ wallet: W, holder }),
+    shortWallet,
+    console: { error() {} },
+  });
+  const msg = (guild, dmOk = true) => {
+    const out = { replies: [], dms: [] };
+    out.message = {
+      guild, author: { id: 'u', send: async (t) => { if (!dmOk) throw new Error('closed'); out.dms.push(t); } },
+      reply: async (t) => { out.replies.push(t); },
+    };
+    return out;
+  };
+  const inChannel = msg({ id: 'g' });
+  await make(false).handleVerify(inChannel.message);
+  assert.doesNotMatch(inChannel.replies.join('\n'), /0x33/, 'no wallet in the channel');
+  assert.match(inChannel.replies[0], /sent you the details by DM/);
+  assert.match(inChannel.dms[0], /0x3333…3333/);
+  assert.match(inChannel.dms[0], /Social Accounts → Discord/);
+
+  const closed = msg({ id: 'g' }, false);
+  await make(false).handleVerify(closed.message);
+  assert.match(closed.replies[0], /Open your DMs/);
+  assert.doesNotMatch(closed.replies.join('\n'), /0x33/);
+
+  const inDm = msg(null);
+  await make(false).handleVerify(inDm.message);
+  assert.match(inDm.replies[0], /0x3333…3333/, 'in a DM the reply has the details');
+
+  const holder = msg({ id: 'g' });
+  await make(true).handleVerify(holder.message);
+  assert.match(holder.replies[0], /You have the \*\*Holder\*\* role/);
+  assert.doesNotMatch(holder.replies[0], /0x33/);
+});

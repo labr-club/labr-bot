@@ -357,7 +357,6 @@ try { db.exec(`ALTER TABLE user_keys ADD COLUMN llm_provider TEXT`); } catch { /
 try { db.exec(`ALTER TABLE user_keys ADD COLUMN llm_api_key TEXT`); } catch { /* already exists */ }
 try { db.exec(`ALTER TABLE user_keys ADD COLUMN llm_model TEXT`); } catch { /* already exists */ }
 
-// Per-provider LLM keys — a user can store anthropic, gemini, openai, and openrouter keys side by side
 // Shared-AI-key messages per holder per UTC day (token access).
 db.exec(`CREATE TABLE IF NOT EXISTS ai_usage (k TEXT PRIMARY KEY, n INTEGER NOT NULL)`);
 const aiUsageStore = {
@@ -365,6 +364,7 @@ const aiUsageStore = {
   set: (k, n) => db.prepare('INSERT INTO ai_usage (k, n) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET n = excluded.n').run(k, n),
 };
 
+// Per-provider LLM keys — a user can store anthropic, gemini, openai, and openrouter keys side by side
 db.exec(`CREATE TABLE IF NOT EXISTS user_llm_keys (
   user_id  TEXT NOT NULL,
   provider TEXT NOT NULL,
@@ -1358,15 +1358,21 @@ async function handleVerify(message) {
     return say('I couldn\'t check right now. Try again in a minute.');
   }
   const sym = tokenAccess.symbol;
+  if (r?.holder) return say(`✅ You hold at least ${ACCESS.min} ${sym}. You have the **${ACCESS.role}** role.`);
+  // Which wallet a handle resolves to is private in Connect, so the address only
+  // ever goes by DM. In a channel the reply says no more than "not enough".
   const where = r?.wallet ? `\`${shortWallet(r.wallet)}\`` : 'no wallet yet';
-  if (r?.holder) return say(`✅ Your Discord resolves to ${where}, which holds at least ${ACCESS.min} ${sym}. You have the **${ACCESS.role}** role.`);
-  return say(
+  const details =
     `Your Discord resolves to ${where}, which holds less than ${ACCESS.min} ${sym} (\`${ACCESS.token}\`).\n\n` +
     'To get access, either:\n' +
     `• get at least ${ACCESS.min} ${sym} into that wallet, or\n` +
     '• if your tokens are in another wallet, link it at https://connect.quid.li and choose it as the wallet for your Discord account (Social Accounts → Discord).\n\n' +
-    'Then run `!verify` again.'
-  );
+    'Then run `!verify` again.';
+  if (!message.guild) return say(details);
+  const dmed = await message.author.send(details).then(() => true).catch(() => false);
+  return say(dmed
+    ? `Not yet: you hold less than ${ACCESS.min} ${sym}. I've sent you the details by DM.`
+    : `Not yet: you hold less than ${ACCESS.min} ${sym}. Open your DMs to me and run \`!verify\` again for the details.`);
 }
 
 // Treasury payouts only pay holders. Checked right before paying, against the
@@ -2679,7 +2685,8 @@ async function handleMessage(message) {
       '   `!llm gemini <key>` — aistudio.google.com/apikey\n' +
       '   `!llm openai <key>` — platform.openai.com\n' +
       '   ...then say "switch to hermes" (or openrouter/gemini/openai) here.\n\n' +
-      '3️⃣ Ask the bot owner to authorize you to use the host key.'
+      '3️⃣ Ask the bot owner to authorize you to use the host key.' +
+      (tokenAccess ? `\n\n4️⃣ Hold at least ${ACCESS.min} ${tokenAccess.symbol} and run \`!verify\`: holders can use the shared key up to a daily limit.` : '')
     ).catch(() => {});
     return;
   }
