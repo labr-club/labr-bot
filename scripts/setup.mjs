@@ -112,13 +112,26 @@ export async function enableIntents(token, flags, fetchImpl = fetch) {
   return again.ok ? missingIntents(again.flags) : missing;
 }
 
+// A real one-token request with the bot's default model, not just a key lookup:
+// listing models works on an account with no credit, and the bot would then
+// fail on its first message. Costs a fraction of a cent.
+export const CHECK_MODEL = 'claude-sonnet-4-6';
 export async function checkAnthropic(key, fetchImpl = fetch) {
-  const res = await fetchImpl('https://api.anthropic.com/v1/models?limit=1', {
-    headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01' },
+  const res = await fetchImpl('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+    body: JSON.stringify({ model: CHECK_MODEL, max_tokens: 1, messages: [{ role: 'user', content: 'hi' }] }),
   });
-  if (res.status === 401 || res.status === 403) return { ok: false, why: 'Anthropic rejected this key.' };
-  if (!res.ok) return { ok: false, why: `Anthropic answered ${res.status}. Try again in a minute.` };
-  return { ok: true };
+  if (res.ok) return { ok: true };
+  let msg = '';
+  try { msg = String((await res.json())?.error?.message ?? ''); } catch { /* no body */ }
+  if (res.status === 401) return { ok: false, why: 'Anthropic rejected this key.' };
+  if (/credit balance/i.test(msg)) {
+    return { ok: false, noCredit: true, why: 'This key works, but the account has no credit. Add some at https://console.anthropic.com/settings/billing' };
+  }
+  if (res.status === 403) return { ok: false, why: `This key can't use ${CHECK_MODEL}. ${msg}`.trim() };
+  if (res.status === 429 || res.status === 529) return { ok: true, busy: true }; // the key is fine; Anthropic is busy
+  return { ok: false, why: `Anthropic answered ${res.status}${msg ? `: ${msg}` : ''}. Try again in a minute.` };
 }
 
 async function connectTool(key, name, args, fetchImpl) {
@@ -252,8 +265,14 @@ async function main() {
   for (;;) {
     v.ANTHROPIC_API_KEY = await askSecret('  Anthropic API key', existing.get('ANTHROPIC_API_KEY'));
     if (!v.ANTHROPIC_API_KEY) continue;
-    const r = await checkAnthropic(v.ANTHROPIC_API_KEY);
-    if (r.ok) { ok('Key works'); break; }
+    let r = await checkAnthropic(v.ANTHROPIC_API_KEY);
+    // No credit: keep the key, wait for the top-up, check again.
+    while (r.noCredit) {
+      bad(r.why);
+      await ask('  Press Enter once credit is added');
+      r = await checkAnthropic(v.ANTHROPIC_API_KEY);
+    }
+    if (r.ok) { ok(r.busy ? 'Key works (Anthropic is busy right now, which is fine)' : 'Key works and has credit'); break; }
     bad(r.why);
   }
 

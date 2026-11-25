@@ -72,8 +72,16 @@ test('intents are switched on through the API when Discord allows it, and re-rea
 });
 
 test('anthropic and connect checks', async () => {
-  assert.equal((await checkAnthropic('k', async () => reply(200, {}))).ok, true);
-  assert.match((await checkAnthropic('k', async () => reply(401, {}))).why, /rejected/);
+  let sent;
+  assert.equal((await checkAnthropic('k', async (url, init) => { sent = { url, body: JSON.parse(init.body) }; return reply(200, {}); })).ok, true);
+  assert.match(sent.url, /\/v1\/messages$/, 'a real request, not a model listing');
+  assert.equal(sent.body.max_tokens, 1);
+  assert.match((await checkAnthropic('k', async () => reply(401, { error: { message: 'invalid x-api-key' } }))).why, /rejected/);
+  const broke = await checkAnthropic('k', async () => reply(400, { error: { type: 'invalid_request_error', message: 'Your credit balance is too low to access the Anthropic API.' } }));
+  assert.equal(broke.noCredit, true);
+  assert.match(broke.why, /no credit.*billing/);
+  assert.deepEqual(await checkAnthropic('k', async () => reply(529, {})), { ok: true, busy: true }, 'overloaded still means the key works');
+  assert.match((await checkAnthropic('k', async () => reply(403, { error: { message: 'no access' } }))).why, /can't use/);
 
   const tools = { connect_me: { profile: { username: 'ana' } }, connect_drop_balance: { walletAddress: '0xabc' } };
   const mcp = async (url, init) => {
