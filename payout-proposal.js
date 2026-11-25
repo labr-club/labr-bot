@@ -82,18 +82,28 @@ function trim(out) {
 const recent = new Map();
 const RECENT_TTL_MS = Number(process.env.PAYOUT_REPROPOSE_TTL_MS ?? 15 * 60 * 1000);
 
-export async function payoutProposal({ repo: rawRepo, since = '14d', token = 'USDC', budget }) {
+const GH_USER = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
+/** "a, @b ,c" -> ['a','b','c'] (lowercased, deduped). Throws on anything that isn't a GitHub username. */
+export function parseExclude(value) {
+  const names = String(value ?? '').split(',').map((s) => s.trim().replace(/^@/, '')).filter(Boolean);
+  for (const n of names) if (!GH_USER.test(n)) throw new Error(`"${n.slice(0, 40)}" is not a GitHub username`);
+  return [...new Set(names.map((n) => n.toLowerCase()))].sort();
+}
+
+export async function payoutProposal({ repo: rawRepo, since = '14d', token = 'USDC', budget, exclude: rawExclude }) {
   const repo = normaliseRepo(rawRepo);
   if (!REPO.test(repo)) return { status: 'refused', error: `could not read a repo out of "${String(rawRepo ?? '').slice(0, 80)}" — paste its GitHub URL, or give owner/name` };
   if (!SINCE.test(since)) return { status: 'refused', error: 'since must look like 14d or 48h' };
   if (!TOKEN.test(token)) return { status: 'refused', error: 'token must be a symbol or a 0x address' };
   if (!/^\d+(\.\d+)?$/.test(String(budget ?? ''))) return { status: 'refused', error: 'budget must be a number' };
   if (!existsSync(resolve(DIR, 'payout.js'))) return { status: 'refused', error: `contributor-payout not found at ${DIR}` };
+  let exclude;
+  try { exclude = parseExclude(rawExclude); } catch (e) { return { status: 'refused', error: e.message }; }
 
   // Keyed on the repo alone. A model that re-asks rarely re-asks identically —
   // "3d" becomes "72h", the symbol becomes a contract address — and any
   // difference used to produce a second, different split for the same request.
-  const key = repo.toLowerCase();
+  const key = `${repo.toLowerCase()}|${exclude.join(',')}`;
   const seen = recent.get(key);
   if (seen && Date.now() - seen.at < RECENT_TTL_MS && existsSync(roundPath(seen.label))) {
     return { ...seen.result, reused: true };
@@ -110,6 +120,7 @@ export async function payoutProposal({ repo: rawRepo, since = '14d', token = 'US
     '--env-file=.env', 'payout.js',
     '--repo', repo, '--since', since, '--token', token,
     '--budget', String(budget), '--payer', 'connect', '--skip-resolve', '--round', label,
+    ...(exclude.length ? ['--exclude', exclude.join(',')] : []),
   ], TIMEOUT_MS);
 
   if (signal === 'SIGKILL') return { status: 'error', error: `timed out after ${TIMEOUT_MS / 1000}s` };
@@ -174,6 +185,20 @@ export async function payoutExecute({ label }) {
 }
 
 /**
+ * GitHub usernames a saved round would pay (amount > 0). Empty when the round
+ * is missing or unreadable; payoutExecute refuses those on its own.
+ */
+export function roundContributors(label) {
+  if (!LABEL.test(label ?? '')) return [];
+  const path = roundPath(label);
+  if (!existsSync(path)) return [];
+  try {
+    const r = JSON.parse(readFileSync(path, 'utf8'));
+    return (r.contributors ?? []).filter((c) => c?.github && Number(c.amount) > 0).map((c) => ({ github: String(c.github) }));
+  } catch { return []; }
+}
+
+/**
  * A one-screen summary of a saved round, read straight from the file.
  * The bot prints this when it asks for confirmation, so what a person approves
  * is the actual split — not whatever the model chose to say about it.
@@ -208,7 +233,7 @@ const WINDOW_WORDS = {
   today: '1d', yesterday: '2d', week: '7d', fortnight: '14d', month: '30d', quarter: '90d',
 };
 
-export function groundCheck({ repo, budget, since }, userText) {
+export function groundCheck({ repo, budget, since, exclude }, userText) {
   const text = String(userText ?? '').toLowerCase();
   if (!text) return null; // nothing to check against (confirm path, tests)
 
@@ -230,6 +255,13 @@ export function groundCheck({ repo, budget, since }, userText) {
   const phrase = Object.entries(WINDOW_WORDS).some(([word, w]) => w === since && text.includes(word));
   if (!spelled.test(text) && !phrase) {
     return `the window "${since}" does not appear in the request`;
+  }
+  // Leaving someone out moves their share to everyone else, so each name must
+  // be one the user actually wrote.
+  let names = [];
+  try { names = parseExclude(exclude); } catch (e) { return e.message; }
+  for (const n of names) {
+    if (!text.includes(n)) return `"${n}" is not named in the request, so it can't be excluded`;
   }
   return null;
 }

@@ -28,7 +28,8 @@ import {
 import { formatReplyContext } from './reply-context.js';
 import { bankrAgent, createBankrThreads, bankrSwapAndDrop } from './bankr.js';
 import { resolveRecipientsToWallets } from './recipients.js';
-import { payoutProposal, payoutExecute, summariseRound, groundCheck, roundHash } from './payout-proposal.js';
+import { payoutProposal, payoutExecute, summariseRound, groundCheck, roundHash, roundContributors } from './payout-proposal.js';
+import { parseAccessConfig, createErc20Reader, createTokenAccess, createDailyCounter, walletFromLookup, shortWallet } from './token-access.js';
 import { createWorldGate, loadWorldConfig } from './world-id.js';
 import { createPayoutApprover, formatPayoutResult } from './payout-approval.js';
 import { appendFileSync, readFileSync } from 'node:fs';
@@ -135,6 +136,10 @@ const HOST_KEY_ROLES = new Set(
   HOST_KEY_ALLOWED_ROLES.split(',').map((s) => s.trim()).filter(Boolean)
 );
 
+// Token-gated access (Labr). null unless ACCESS_TOKEN is set; see token-access.js.
+// The holder role counts as a host-key role, capped per day by holdings.
+const ACCESS = parseAccessConfig(process.env);
+
 // Providers that would otherwise silently fall back to a host key.
 // 'openrouter' is per-user by design and never touch host credentials.
 const HOST_KEY_PROVIDERS = new Set(['anthropic', 'gemini', 'openai', 'hermes']);
@@ -147,7 +152,23 @@ function mayUseHostKey(userId, username, member) {
     const roles = member?.roles?.cache?.map((r) => r.name) ?? [];
     if (roles.some((r) => HOST_KEY_ROLES.has(r))) return true;
   }
+  if (ACCESS) {
+    const roles = member?.roles?.cache?.map((r) => r.name) ?? [];
+    if (roles.includes(ACCESS.role)) return true;
+  }
   return false;
+}
+
+// True when the holder role is the ONLY thing letting this member use the host
+// key. Those members get a daily cap; owner, listed users and other roles don't.
+function hostKeyViaHolderOnly(userId, username, member) {
+  if (!ACCESS) return false;
+  if (BOT_OWNER_ID && String(userId) === String(BOT_OWNER_ID)) return false;
+  if (HOST_KEY_USERS.has(String(userId).toLowerCase())) return false;
+  if (username && HOST_KEY_USERS.has(String(username).replace(/^@/, '').toLowerCase())) return false;
+  const roles = member?.roles?.cache?.map((r) => r.name) ?? [];
+  if (roles.some((r) => HOST_KEY_ROLES.has(r))) return false;
+  return roles.includes(ACCESS.role);
 }
 
 const DISCORD_MSG_LIMIT = 1900;
@@ -337,6 +358,13 @@ try { db.exec(`ALTER TABLE user_keys ADD COLUMN llm_api_key TEXT`); } catch { /*
 try { db.exec(`ALTER TABLE user_keys ADD COLUMN llm_model TEXT`); } catch { /* already exists */ }
 
 // Per-provider LLM keys — a user can store anthropic, gemini, openai, and openrouter keys side by side
+// Shared-AI-key messages per holder per UTC day (token access).
+db.exec(`CREATE TABLE IF NOT EXISTS ai_usage (k TEXT PRIMARY KEY, n INTEGER NOT NULL)`);
+const aiUsageStore = {
+  get: (k) => db.prepare('SELECT n FROM ai_usage WHERE k = ?').get(k)?.n,
+  set: (k, n) => db.prepare('INSERT INTO ai_usage (k, n) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET n = excluded.n').run(k, n),
+};
+
 db.exec(`CREATE TABLE IF NOT EXISTS user_llm_keys (
   user_id  TEXT NOT NULL,
   provider TEXT NOT NULL,
@@ -1225,6 +1253,7 @@ const tools = [
         budget: { type: 'string', description: 'Total to split, in units of the token, e.g. "5000".' },
         token: { type: 'string', description: 'Reward token symbol or 0x contract address on Base. Default USDC.' },
         since: { type: 'string', description: 'How far back to look, as the user said it: "3d", "48h", "2 weeks" -> "14d". Required — never leave it out and never substitute a default, because the window decides which PRs are scored and a wrong one silently rewards the wrong people.' },
+        exclude: { type: 'string', description: 'GitHub usernames to leave out of the split, comma-separated, exactly as the user wrote them. Only when the user asks to exclude someone.' },
       },
       required: ['repo', 'budget', 'since'],
     },
@@ -1269,10 +1298,106 @@ const heldOutcomeRecords = createRecordQueue();
 // purpose: no record, no payment.
 const worldAudit = (event) => appendFileSync(new URL('./world-approvals.jsonl', import.meta.url), JSON.stringify(event) + '\n');
 const worldGate = createWorldGate({ cfg: loadWorldConfig(), audit: worldAudit });
+// ─── Token access (Labr) ──────────────────────────────────────────────────────
+// Which wallet a handle resolves to is Connect's answer (each member picks it per
+// platform at connect.quid.li); the balance is read from the token's chain.
+async function resolveAccessWallet(recipient) {
+  for (let i = 0; i < 3; i++) {
+    const text = await mcpCallTool('connect_lookup', { recipients: [recipient] }, QUIDLI_API_KEY);
+    let body = null;
+    try { body = JSON.parse(text); } catch { /* not JSON */ }
+    if (body?.status === 'processing') { await new Promise((r) => setTimeout(r, 1500)); continue; }
+    return walletFromLookup(body);
+  }
+  return null;
+}
+const tokenAccess = ACCESS && QUIDLI_API_KEY
+  ? createTokenAccess({ cfg: ACCESS, resolve: resolveAccessWallet, reader: createErc20Reader({ rpcUrl: ACCESS.rpcUrl, token: ACCESS.token }) })
+  : null;
+if (ACCESS && !QUIDLI_API_KEY) console.error('[access] ACCESS_TOKEN is set but QUIDLI_API_KEY is not: wallets cannot be resolved, so token access is OFF and nobody gets the holder role.');
+const aiCounter = createDailyCounter({ store: aiUsageStore });
+
+// Gives or removes the holder role from a real reading. A failed check throws
+// and changes nothing.
+async function syncAccess(member, { fresh = false } = {}) {
+  if (!tokenAccess?.isReady || !member || member.user?.bot) return null;
+  const role = member.guild.roles.cache.find((r) => r.name === ACCESS.role);
+  if (!role) throw new Error(`role "${ACCESS.role}" not found in ${member.guild.name}`);
+  const r = await tokenAccess.check({ type: 'discord', id: String(member.id) }, { fresh });
+  const has = member.roles.cache.has(role.id);
+  if (r.holder && !has) {
+    await member.roles.add(role, 'holds the access token');
+    console.log(`[access] +${ACCESS.role} ${member.user?.username ?? member.id}`);
+  } else if (!r.holder && has) {
+    await member.roles.remove(role, 'no longer holds the access token');
+    console.log(`[access] -${ACCESS.role} ${member.user?.username ?? member.id}`);
+  }
+  return r;
+}
+
+async function recheckAllAccess() {
+  if (!tokenAccess?.isReady || !activeGuild) return;
+  const members = await activeGuild.members.fetch();
+  let failed = 0;
+  for (const m of members.values()) {
+    if (m.user.bot) continue;
+    try { await syncAccess(m, { fresh: true }); } catch (err) { failed++; console.error(`[access] check failed for ${m.id}: ${err.message}`); }
+    await new Promise((r) => setTimeout(r, 300)); // stay well under Connect's rate limit
+  }
+  console.log(`[access] recheck done: ${members.size} members, ${failed} failed`);
+}
+
+async function handleVerify(message) {
+  const say = (text) => message.reply(text).catch(() => {});
+  if (!tokenAccess?.isReady) return say('Access checks aren\'t running right now. Try again later.');
+  const member = activeGuild ? await activeGuild.members.fetch(message.author.id).catch(() => null) : null;
+  if (!member) return say('Join the Labr server first, then run `!verify`.');
+  let r;
+  try { r = await syncAccess(member, { fresh: true }); } catch (err) {
+    console.error('[access] verify failed:', err.message);
+    return say('I couldn\'t check right now. Try again in a minute.');
+  }
+  const sym = tokenAccess.symbol;
+  const where = r?.wallet ? `\`${shortWallet(r.wallet)}\`` : 'no wallet yet';
+  if (r?.holder) return say(`✅ Your Discord resolves to ${where}, which holds at least ${ACCESS.min} ${sym}. You have the **${ACCESS.role}** role.`);
+  return say(
+    `Your Discord resolves to ${where}, which holds less than ${ACCESS.min} ${sym} (\`${ACCESS.token}\`).\n\n` +
+    'To get access, either:\n' +
+    `• get at least ${ACCESS.min} ${sym} into that wallet, or\n` +
+    '• if your tokens are in another wallet, link it at https://connect.quid.li and choose it as the wallet for your Discord account (Social Accounts → Discord).\n\n' +
+    'Then run `!verify` again.'
+  );
+}
+
+// Treasury payouts only pay holders. Checked right before paying, against the
+// wallet each contributor's GitHub resolves to (the one the payout would use).
+async function payoutHolderCheck(label) {
+  if (!tokenAccess) return null;
+  if (!tokenAccess.isReady) return 'token access checks are not running, so holders cannot be checked';
+  const missing = [];
+  for (const c of roundContributors(label)) {
+    let r;
+    try { r = await tokenAccess.check({ type: 'github', username: c.github }, { fresh: true }); }
+    catch (err) { return `could not check @${c.github} (${err.message})`; }
+    if (!r.holder) missing.push(c.github);
+  }
+  if (!missing.length) return null;
+  const who = missing.map((g) => `@${g}`).join(', ');
+  return `${who} ${missing.length > 1 ? "don't" : "doesn't"} hold at least ${ACCESS.min} ${tokenAccess.symbol} on the wallet their GitHub resolves to. Run the payout again excluding them, or they can link a wallet that holds it at connect.quid.li and choose it for their GitHub account`;
+}
+async function gatedPayoutExecute({ label }) {
+  const blocked = await payoutHolderCheck(label);
+  if (blocked) {
+    console.log(`[payout] holder check blocked ${label}: ${blocked}`);
+    return { status: 'refused', executed: false, error: `Not paid: ${blocked}.` };
+  }
+  return payoutExecute({ label });
+}
+
 const payoutApprover = createPayoutApprover({
   gate: worldGate,
   roundHash,
-  execute: payoutExecute,
+  execute: gatedPayoutExecute,
   audit: worldAudit,
   track: (p) => shutdown.track(p, 'payout'),
   isStopping: () => shutdown.stopping,
@@ -1775,7 +1900,7 @@ async function runTool(name, input, {
     } else if (confirmed) {
       // Default: the owner typed !confirm <code> for the round the bot posted.
       console.log(`[payout] execute label=${input.label}`);
-      const done = await payoutExecute({ label: input.label });
+      const done = await gatedPayoutExecute({ label: input.label });
       console.log(`[payout] execute ${done.status}`);
       return JSON.stringify(done, null, 2);
     }
@@ -2559,6 +2684,27 @@ async function handleMessage(message) {
     return;
   }
 
+  // Holders on the shared key get a daily cap that grows with what they hold.
+  if (HOST_KEY_PROVIDERS.has(activeProvider) && !hasOwnKeyForProvider
+      && hostKeyViaHolderOnly(message.author.id, message.author.username, message.member)) {
+    let perDay;
+    try {
+      if (!tokenAccess?.isReady) throw new Error('token access not ready');
+      perDay = (await tokenAccess.check({ type: 'discord', id: String(message.author.id) })).perDay;
+    } catch (err) {
+      console.error('[access] AI cap check failed:', err.message);
+      await message.reply('I couldn\'t check your holdings right now. Try again in a minute.').catch(() => {});
+      return;
+    }
+    if (!aiCounter.take(message.author.id, perDay)) {
+      await message.reply(perDay === 0
+        ? `Your wallet no longer holds ${ACCESS.min} ${tokenAccess.symbol}, so the shared AI key is off for you. Run \`!verify\` once it does, or DM me \`!llm <provider> <key>\` to use your own.`
+        : `You've used today's ${perDay} messages on the shared AI key. It resets at 00:00 UTC. Holding more raises the limit, or DM me \`!llm <provider> <key>\` to use your own.`
+      ).catch(() => {});
+      return;
+    }
+  }
+
   // Replace @user mentions with the recipient Connect takes:
   // @name = {"type":"discord","id":"123456"}
   // Replace @role mentions with "roleName (Role ID: 123456)"
@@ -2957,7 +3103,8 @@ async function handleDM(message) {
       '`!bankr-remove` — remove your Bankr key\n' +
       '`!llm <provider> <api-key>` — bring your own LLM key (anthropic, gemini, openai, openrouter for 100+ models, or hermes)\n' +
       '`!llm-remove` — remove your LLM key\n' +
-      '`!confirm <code>` / `!cancel <code>` — run or drop a transfer held for confirmation (`!confirm` alone lists them)\n\n' +
+      '`!confirm <code>` / `!cancel <code>` — run or drop a transfer held for confirmation (`!confirm` alone lists them)\n' +
+      (ACCESS ? '`!verify` — check your wallet and get the holder role\n' : '') + '\n' +
       '📄 Attach a PDF (up to 3, 10 MB each, text-based) and I\'ll read it. While a document is in the conversation, any transfer I start waits for your `!confirm`.\n\n' +
       'Get a Quidli API key at https://connect.quid.li'
     );
@@ -3171,9 +3318,22 @@ client.once(Events.ClientReady, (c) => {
   loadChainNames().catch((err) => console.error('[chains] load failed, using the built-in names:', err.message));
   // Additive and non-blocking — a failure here leaves the hardcoded tools intact.
   registerMcpTools();
+  if (tokenAccess) {
+    tokenAccess.ready().then(({ symbol }) => {
+      console.log(`   Token access: ${ACCESS.min} ${symbol} (${ACCESS.token}, chain ${ACCESS.chainId}) -> role ${ACCESS.role}; AI tiers ${ACCESS.tiers.map((t) => `${t.held}:${t.perDay}/day`).join(', ')}`);
+      const run = () => recheckAllAccess().catch((err) => console.error('[access] recheck failed:', err.message));
+      run();
+      setInterval(run, ACCESS.recheckMs).unref?.();
+    }).catch((err) => console.error(`[access] NOT active: could not read the token (${err.message}). Holders keep their role; nobody new gets it.`));
+  }
 });
 
 client.on(Events.GuildCreate, (guild) => { leaveIfNotAllowed(guild); });
+
+client.on(Events.GuildMemberAdd, (member) => {
+  if (!tokenAccess || !guildAllowed(member.guild.id)) return;
+  syncAccess(member, { fresh: true }).catch((err) => console.error('[access] join check failed:', err.message));
+});
 
 client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot) return;
@@ -3201,6 +3361,11 @@ client.on(Events.MessageCreate, async (message) => {
       replies: '✅ Sends now wait for `!confirm` when you\'re replying to someone else\'s message.',
     }[choice];
     await message.reply(`${said} A document in the chat still makes sends wait.`).catch(() => {});
+    return;
+  }
+  // !verify works in DMs and channels, mention or not; it only checks the sender.
+  if (tokenAccess && /^(?:<@!?\d+>\s*)?!verify\s*$/i.test(message.content.trim())) {
+    handleVerify(message).catch((err) => console.error('[access] verify error:', err));
     return;
   }
   // DMs: handle !connect / !revoke commands

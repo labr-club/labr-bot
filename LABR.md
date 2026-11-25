@@ -30,6 +30,20 @@ said the treasury "funds bounties".
 | Payout approval | `!confirm` by default. World ID is opt-in with `PAYOUT_APPROVAL=world_id`. |
 | No Minds | The Minds (Animoca Brands) provider is removed: no `!minds` commands, no "switch to minds", no `@animocabrands/minds-client-lib` dependency. The unused `minds_*` columns stay in `users.db`. |
 
+## Token access
+
+Off unless `ACCESS_TOKEN` is set (see `.env.example`). One token, three unlocks:
+
+| Unlock | How |
+|---|---|
+| The server | Holders get `ACCESS_ROLE` (default `Holder`); Discord channel permissions do the rest. Checked on join, on `!verify`, and for every member every `ACCESS_RECHECK_MIN` (default 6 h). A failed check (Connect or the RPC down) changes nothing. |
+| Shared AI key | The holder role counts as a host-key role. Members who have it and nothing else (not the owner, not in `HOST_KEY_ALLOWED_USERS`, no role in `HOST_KEY_ALLOWED_ROLES`) get `ACCESS_AI_TIERS` messages per UTC day, by how much they hold. Counts live in `users.db` (`ai_usage`). |
+| Treasury payouts | Right before a payout runs, every contributor it pays must hold the minimum on the wallet their GitHub resolves to. Otherwise nothing is paid and the bot names who to leave out. The payout tool takes `exclude` (GitHub usernames the user wrote) for the re-run. |
+
+Which wallet counts is Connect's answer for the handle: members who hold in another wallet link it at connect.quid.li and pick it as the wallet for their Discord (and GitHub) account. Holdings are read with `balanceOf` on `ACCESS_CHAIN_ID`; one wallet per handle, not a sum.
+
+Setup in Discord: create the `Holder` role, put the bot's role above it, give `@everyone` only `#welcome`, `#rules` and a `#get-access` channel, and open the rest to `Holder`, `Maintainer` and `Contributor`.
+
 ## Not covered
 
 - `bankr_swap_and_drop` sends are not posted to `#payouts` (the Labr instance runs without a Bankr key).
@@ -62,6 +76,7 @@ OWNER_USES_HOST_KEY=false
 HOST_KEY_ALLOWED_ROLES=Maintainer,Contributor
 # no BANKR_API_KEY on purpose
 # optional: MAX_SEND_USD (default 50), DAILY_SEND_USD (default 200)
+# token access, once the token exists: ACCESS_TOKEN, ACCESS_MIN, ACCESS_AI_TIERS
 ```
 
 ## Updating the running bot

@@ -223,6 +223,8 @@ function buildRunTool(overrides = {}) {
     groundCheck: () => null,
     summariseRound: (label) => `round ${label}`,
     payoutExecute: async () => { calls.push({ tool: 'payout' }); return { status: 'ok', executed: true }; },
+    // Labr: runTool pays through the holder check; with token access off it is a pass-through.
+    gatedPayoutExecute: async () => { calls.push({ tool: 'payout' }); return { status: 'ok', executed: true }; },
     payoutProposal: async () => ({ status: 'ok', label: 'dc-demo-1', proposal: '@alice — 100 BNKR (100.00%)' }),
     mcpToolNames: new Set(['connect_drop']),
     explorerTxUrl: (c, h) => (h ? `https://basescan.org/tx/${h}` : null),
@@ -361,7 +363,7 @@ test('every runTool branch that spends or schedules money is gated', () => {
   const branches = [...runToolSrc.matchAll(/if \(name === '([a-z_]+)'\) \{([\s\S]*?)\n  \}/g)];
   assert.ok(branches.length > 5, 'branch parser still matches runTool');
   const spending = branches
-    .filter(([, , body]) => /quidliDrop\(|bankrAgent\(|bankrSwapAndDrop\(|payoutExecute\(|INSERT INTO (scheduled_drops|watchers)/.test(body))
+    .filter(([, , body]) => /quidliDrop\(|bankrAgent\(|bankrSwapAndDrop\(|payoutExecute\(|gatedPayoutExecute\(|INSERT INTO (scheduled_drops|watchers)/.test(body))
     .map(([, name]) => name);
   // payout executes in runTool only on the confirmed (!confirm) call; in World ID
   // mode that call is refused and payout-approval.js runs it instead.
