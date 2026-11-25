@@ -157,25 +157,58 @@ const ok = (s) => console.log(`  \x1b[32m✓\x1b[0m ${s}`);
 const bad = (s) => console.log(`  \x1b[31m✗\x1b[0m ${s}`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// One question per readline interface, closed right after, so nothing is left
+// listening to stdin while a key is typed.
+async function ask(q, def = '') {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try { return (await rl.question(`${q}${def ? ` [${def}]` : ''}: `)).trim() || def; }
+  finally { rl.close(); }
+}
+
+// Keys are read in raw mode: the label stays on screen and each character shows
+// as a dot, so a paste visibly lands. Without a terminal (piped input) it falls
+// back to a plain line read.
+export function readHidden(prompt, { input = process.stdin, output = process.stdout } = {}) {
+  if (!input.isTTY) return ask(prompt);
+  output.write(`${prompt}: `);
+  return new Promise((resolve) => {
+    let buf = '';
+    const done = () => {
+      input.off('data', onData);
+      input.setRawMode(false);
+      input.pause();
+      output.write('\n');
+      resolve(buf.trim());
+    };
+    const onData = (chunk) => {
+      for (const ch of chunk.toString('utf8')) {
+        if (ch === '\r' || ch === '\n') return done();
+        if (ch === '\u0003') { output.write('\n'); process.exit(130); }
+        if (ch === '\u007f' || ch === '\b') {
+          if (buf) { buf = buf.slice(0, -1); output.write('\b \b'); }
+          continue;
+        }
+        if (ch < ' ') continue;
+        buf += ch;
+        output.write('•');
+      }
+    };
+    input.setRawMode(true);
+    input.resume();
+    input.on('data', onData);
+  });
+}
+
+async function askSecret(q, current) {
+  const hint = looksUnset(current) ? '' : ` [Enter keeps …${String(current).slice(-4)}]`;
+  const a = await readHidden(`${q}${hint}`);
+  return a || (looksUnset(current) ? '' : current);
+}
+
 async function main() {
   const [major] = process.versions.node.split('.').map(Number);
   if (major < 22) { console.error(`Labr needs Node 22 or newer (this is ${process.versions.node}).`); process.exit(1); }
 
-  const rl = createInterface({ input: process.stdin, output: process.stdout, terminal: true });
-  // Keys are typed or pasted without echo.
-  const askSecret = async (q, current) => {
-    const hint = looksUnset(current) ? '' : ` [Enter keeps …${String(current).slice(-4)}]`;
-    process.stdout.write(`${q}${hint}: `);
-    rl.output.mute = true;
-    const write = rl._writeToOutput;
-    rl._writeToOutput = (s) => { if (!rl.output.mute) write.call(rl, s); };
-    const a = (await rl.question('')).trim();
-    rl._writeToOutput = write;
-    rl.output.mute = false;
-    process.stdout.write('\n');
-    return a || (looksUnset(current) ? '' : current);
-  };
-  const ask = async (q, def = '') => ((await rl.question(`${q}${def ? ` [${def}]` : ''}: `)).trim() || def);
 
   const existing = existsSync(ENV_PATH) ? parseEnv(readFileSync(ENV_PATH, 'utf8')) : new Map();
   const v = {};
@@ -272,7 +305,6 @@ async function main() {
   console.log(`\n${b('Done.')} Settings are in .env (only on this machine).`);
   const hasPm2 = spawnSync('pm2', ['-v'], { stdio: 'ignore' }).status === 0;
   const start = (await ask(`  Start Labr now${hasPm2 ? ' with pm2 (keeps running after you close this)' : ''}? (Y/n)`, 'Y')).toLowerCase();
-  rl.close();
   if (start.startsWith('n')) {
     console.log(`\n  Start it later with ${hasPm2 ? '`pm2 start labr.config.cjs && pm2 save`' : '`npm start`'}.`);
   } else if (hasPm2) {
