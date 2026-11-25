@@ -7,7 +7,10 @@
  * - Per-user Quidli API keys: DM !connect YOUR_KEY to use your own Smart Send wallet
  */
 
-import 'dotenv/config';
+import dotenv from 'dotenv';
+// .env wins over variables already in the shell, so the keys `npm run setup`
+// wrote are the ones used. Hosts without a .env (cloud) still read their env.
+dotenv.config({ override: true, quiet: true });
 import Anthropic from '@anthropic-ai/sdk';
 import { DatabaseSync } from 'node:sqlite';
 import { createCipheriv, createDecipheriv } from 'node:crypto';
@@ -3318,7 +3321,7 @@ client.once(Events.ClientReady, (c) => {
   const defaultModel = DEFAULT_LLM_PROVIDER === 'gemini' ? GEMINI_MODEL
     : DEFAULT_LLM_PROVIDER === 'openai' ? OPENAI_MODEL
     : CLAUDE_MODEL;
-  console.log(`✅ Claudetaur ready — logged in as ${c.user.tag}`);
+  console.log(`✅ Labr ready, logged in as ${c.user.tag}`);
   console.log(`   Default LLM: ${DEFAULT_LLM_PROVIDER} (${defaultModel})`);
   console.log(`   Prompt: ${PROMPT_SOURCE}`);
   console.log(`   Payout approval: ${PAYOUT_USES_WORLD_ID ? (worldGate.configured ? 'World ID' : 'World ID requested but NOT configured, payouts disabled') : '!confirm'}`);

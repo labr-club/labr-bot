@@ -42,6 +42,9 @@ export function inviteUrl(appId) {
   return `https://discord.com/oauth2/authorize?client_id=${appId}&scope=bot&permissions=${BOT_PERMISSIONS}`;
 }
 
+// Optional keys the bot picks up from the environment if they're there.
+export const SHELL_KEYS = ['BANKR_API_KEY', 'OPENAI_API_KEY', 'GEMINI_API_KEY', 'NOUS_API_KEY', 'BRAVE_SEARCH_API_KEY', 'ACCESS_TOKEN'];
+
 export const looksUnset = (v) => !v || /^your_.*_here$/.test(String(v).trim());
 
 export function parseEnv(text) {
@@ -278,6 +281,14 @@ async function main() {
     console.log(`\n  (Your previous .env is saved as ${bak.split('/').pop()})`);
   }
   writeFileSync(ENV_PATH, renderEnv(v, existing), { mode: 0o600 });
+
+  // Keys exported in the shell (e.g. by another tool) also reach the bot when
+  // .env doesn't set them. Say so, so nothing is switched on by surprise.
+  const fromShell = SHELL_KEYS.filter((k) => process.env[k] && !(k in v) && looksUnset(existing.get(k)));
+  if (fromShell.length) {
+    console.log(`\n  Note: ${fromShell.join(', ')} ${fromShell.length > 1 ? 'are' : 'is'} set in your shell, so the bot will use ${fromShell.length > 1 ? 'them' : 'it'} too.`);
+    console.log('  To keep the bot off it, add an empty line for it to .env (e.g. BANKR_API_KEY=).');
+  }
 
   // 4. Server
   console.log(`\n${b('4/4 Add the bot to your server')}`);
