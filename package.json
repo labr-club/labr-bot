@@ -5,6 +5,7 @@
   "main": "bot.js",
   "type": "module",
   "scripts": {
+    "setup": "node scripts/setup.mjs",
     "start": "node bot.js",
     "dev": "node --watch bot.js",
     "test": "node --test",

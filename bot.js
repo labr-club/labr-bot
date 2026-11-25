@@ -103,8 +103,15 @@ const NOUS_API_BASE_URL = 'https://inference-api.nousresearch.com/v1';
 
 const REQUIRE_USER_LLM = REQUIRE_USER_LLM_KEY === 'true';
 
-if (!DISCORD_TOKEN) throw new Error('DISCORD_TOKEN is required');
-if (!ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY is required');
+// A missing key stops the bot with one line that says what to do, not a stack trace.
+{
+  const unset = (v) => !v || /^your_.*_here$/.test(String(v).trim());
+  const missing = [['DISCORD_TOKEN', DISCORD_TOKEN], ['ANTHROPIC_API_KEY', ANTHROPIC_API_KEY]].filter(([, v]) => unset(v)).map(([k]) => k);
+  if (missing.length) {
+    console.error(`\n${missing.join(' and ')} ${missing.length > 1 ? 'are' : 'is'} not set. Run \`npm run setup\` to set the bot up.\n`);
+    process.exit(1);
+  }
+}
 if (!QUIDLI_API_KEY) console.warn('⚠️  QUIDLI_API_KEY not set — only users with their own linked key can send.');
 
 const ACTIVE_CHANNELS = new Set(
@@ -3401,4 +3408,12 @@ client.on(Events.Error, (err) => console.error('[discord] client error:', err?.m
 shutdown.onStop(() => client.destroy());
 shutdown.install();
 
-client.login(DISCORD_TOKEN);
+client.login(DISCORD_TOKEN).catch((err) => {
+  const why = err?.code === 'TokenInvalid'
+    ? 'Discord rejected DISCORD_TOKEN. Copy it again from the Bot page (Reset Token), or run `npm run setup`.'
+    : /disallowed intents/i.test(err?.message ?? '')
+      ? 'Discord refused the bot\'s intents. Turn on Message Content, Server Members and Presence under Bot → Privileged Gateway Intents, or run `npm run setup`.'
+      : `Could not log in to Discord: ${err?.message ?? err}`;
+  console.error(`\n${why}\n`);
+  process.exit(1);
+});
