@@ -3347,6 +3347,7 @@ client.once(Events.ClientReady, (c) => {
   console.log(`✅ Labr ready, logged in as ${c.user.tag}`);
   console.log(`   Default LLM: ${DEFAULT_LLM_PROVIDER} (${defaultModel})`);
   console.log(`   Prompt: ${PROMPT_SOURCE}`);
+  console.log(`   Default chain: ${DEFAULT_CHAIN_INFO.name}`);
   console.log(`   Payout approval: ${PAYOUT_USES_WORLD_ID ? (worldGate.configured ? 'World ID' : 'World ID requested but NOT configured, payouts disabled') : '!confirm'}`);
   if (GEMINI_API_KEY) console.log(`   Gemini: ${GEMINI_MODEL} ✓`);
   if (OPENAI_API_KEY) console.log(`   OpenAI: ${OPENAI_MODEL} ✓`);
