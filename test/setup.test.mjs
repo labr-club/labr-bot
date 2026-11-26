@@ -89,7 +89,7 @@ test('anthropic and connect checks', async () => {
     assert.equal(init.headers['x-api-key'], 'k');
     return reply(200, { result: { content: [{ type: 'text', text: JSON.stringify(tools[params.name]) }] } });
   };
-  assert.deepEqual(await checkConnect('k', mcp), { ok: true, username: 'ana', smartSendWallet: '0xabc' });
+  assert.deepEqual(await checkConnect('k', mcp), { ok: true, username: 'ana', smartSendWallet: '0xabc', lowGas: false });
   assert.match((await checkConnect('k', async () => reply(401, {}))).why, /connect\.quid\.li/);
   const noSmartSend = async (url, init) => {
     const { params } = JSON.parse(init.body);
@@ -176,4 +176,23 @@ test('Nous check: uses a live free model that answers a tool call, skipping ones
   assert.deepEqual(tried, ['y/broken:free', 'z/works:free'], 'a retired preferred model and tool-less ones are skipped');
   assert.match((await checkNous('k', undefined, async (u, i = {}) => (i.method ? reply(401, {}) : reply(200, { data: [{ id: 'z/w:free', supported_parameters: ['tools'] }] })))).why, /rejected/);
   assert.match((await checkNous('k', undefined, async () => reply(200, { data: [] }))).why, /no free model/);
+});
+
+test('Solana as the default chain: setup reads the Solana wallet and warns when SOL is low', async () => {
+  const { CHAINS } = await import('../default-chain.js');
+  const reply = (status, body) => ({ status, ok: status < 400, json: async () => body });
+  const withSol = (lamports) => async (url, init) => {
+    const { params } = JSON.parse(init.body);
+    const data = params.name === 'connect_me' ? { profile: { username: 'ana' } }
+      : (assert.equal(params.arguments.chainId, 1399811149), { walletAddress: 'So1Wallet', assets: [{ type: 'native', balanceInWei: lamports }] });
+    return reply(200, { result: { content: [{ type: 'text', text: JSON.stringify(data) }] } });
+  };
+  const low = await checkConnect('k', withSol('48593'), CHAINS.solana);
+  assert.equal(low.smartSendWallet, 'So1Wallet');
+  assert.equal(low.lowGas, true);
+  assert.equal((await checkConnect('k', withSol('48593121'), CHAINS.solana)).lowGas, false);
+});
+
+test('DEFAULT_CHAIN is written to .env', () => {
+  assert.match(renderEnv({ DEFAULT_CHAIN: 'solana' }), /DEFAULT_CHAIN=solana/);
 });

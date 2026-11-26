@@ -39,6 +39,7 @@ import { appendFileSync, readFileSync } from 'node:fs';
 import { createMcpRegistry, MCP_CONFIRM_TOOLS, formatToolRecord } from './connect-mcp.js';
 import { createShutdown } from './shutdown.js';
 import { createSecretBox } from './secrets.js';
+import { parseDefaultChain, defaultChainPrompt, SOLANA_CHAIN_ID } from './default-chain.js';
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -65,6 +66,8 @@ const {
   // 'false' = the owner pays from their own linked key like everyone else, and
   // the host QUIDLI_API_KEY never pays for a send. Default keeps the old fallback.
   OWNER_USES_HOST_KEY = 'true',
+  // Chain for sends that don't name one: base (default, gas sponsored) or solana.
+  DEFAULT_CHAIN,
   MASTER_ENCRYPTION_KEY,        // 64 hex chars (32 bytes) — used to encrypt stored API keys
   BOT_OWNER_ID,                 // Discord user ID of the bot owner — uses host QUIDLI_API_KEY for drops automatically
   BRAVE_SEARCH_API_KEY,         // Brave Search API key for web search tool
@@ -211,6 +214,9 @@ function readPromptFile(path) {
 }
 const SYSTEM_PROMPT_FROM_FILE = readPromptFile(SYSTEM_PROMPT_FILE);
 const SYSTEM_PROMPT_OVERRIDE = SYSTEM_PROMPT_FROM_FILE || SYSTEM_PROMPT_ENV;
+const { chain: DEFAULT_CHAIN_INFO, warning: DEFAULT_CHAIN_WARNING } = parseDefaultChain(DEFAULT_CHAIN);
+const DEFAULT_CHAIN_ID = DEFAULT_CHAIN_INFO.id;
+if (DEFAULT_CHAIN_WARNING) console.warn(`⚠️  ${DEFAULT_CHAIN_WARNING}`);
 const PROMPT_SOURCE = SYSTEM_PROMPT_FROM_FILE ? `file ${SYSTEM_PROMPT_FILE}` : SYSTEM_PROMPT_ENV ? 'SYSTEM_PROMPT in .env' : 'built-in';
 
 const SYSTEM_PROMPT = SYSTEM_PROMPT_OVERRIDE || `
@@ -234,7 +240,7 @@ You are DiscoCentaur, a Discord bot that sends crypto tokens to people using Qui
 - Email, phone, Twitter/X, and Farcaster recipients: connect_lookup auto-generates a wallet for them even if they've never used Quidli before — it works for ANY real, existing account on these platforms, not just ones already linked to Quidli. The first call often returns status "processing" — call connect_lookup again with the same identical payload (wait ~2s between tries, up to 5 tries) until it returns "completed". Each retry is a real tool round, so do not exceed 5. This is expected and means a wallet is being created; do not give up early.
 - Telegram recipients are different: Telegram's platform does not allow looking up an arbitrary @username unless that person has already interacted with a bot, or Quidli already has their numeric Telegram ID some other way. This means a raw Telegram @username with no prior bot interaction will fail immediately (status "completed" with them in "failed") even if it's a real, famous account — this is NOT something retrying will fix. If you have the person's numeric Telegram ID (e.g. from message context in this chat, or via connect_lookup_exposed), use that instead of their username — it resolves reliably.
 - USDC on Base: chainId=8453, tokenContract=0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913, 1 USDC = 1000000 amountInWeiPerRecipient (6 decimals).
-- Base (8453) is the default. If the user names any other chain, call connect_get_chains first and use the chainId whose name matches what they said. Never guess a chain ID and never substitute a similar-sounding chain; if nothing matches, say so.
+- If the user names no chain, use the default chain (see "Default chain for this server" below). If the user names any other chain, call connect_get_chains first and use the chainId whose name matches what they said. Never guess a chain ID and never substitute a similar-sounding chain; if nothing matches, say so.
 - Always check the balance on the chain you are about to send on before sending.
 - Never reuse a token contract address across chains. The USDC address on Base is not USDC anywhere else.
 - After success, show the explorer link the drop tool returns (explorerUrl). Do not construct one yourself — it differs per chain, and a link you invent will be stripped before the user sees it.
@@ -882,6 +888,8 @@ const CHAIN_EXPLORERS = {
   143: 'https://monadscan.com/tx/',
   4663: 'https://robinhoodchain.blockscout.com/tx/',
   5042: 'https://explorer.arc.io/tx/',
+  42220: 'https://celoscan.io/tx/',
+  480: 'https://worldscan.org/tx/',
   1399811149: 'https://solscan.io/tx/',
 };
 function explorerTxUrl(chainId, hash) {
@@ -899,7 +907,7 @@ function quidliDrop(args, apiKey) {
 // Scheduled and conditional drops, watchers, claims and swap-and-send send
 // through Connect's MCP connect_drop. Recipients go as given; Connect resolves
 // them for the chain.
-async function quidliDropOnce({ recipients, amountInWeiPerRecipient, chainId = 8453, tokenContract }, apiKey = QUIDLI_API_KEY) {
+async function quidliDropOnce({ recipients, amountInWeiPerRecipient, chainId = DEFAULT_CHAIN_ID, tokenContract }, apiKey = QUIDLI_API_KEY) {
   if (!apiKey) {
     throw new Error('No Quidli API key available for this drop. Link your Connect key, or ask the bot owner to configure a host key.');
   }
@@ -1158,7 +1166,7 @@ const tools = [
         },
         amountInWeiPerRecipient: { type: 'string', description: 'Amount in wei per recipient.' },
         tokenContract: { type: 'string', description: 'Token contract address.' },
-        chainId: { type: 'number', description: 'Chain ID. Base = 8453 (default).' },
+        chainId: { type: 'number', description: `Chain ID. Default: ${DEFAULT_CHAIN_INFO.name} (${DEFAULT_CHAIN_ID}).` },
       },
       required: ['delayMinutes', 'amountInWeiPerRecipient', 'tokenContract'],
     },
@@ -1206,7 +1214,7 @@ const tools = [
         maxWinners: { type: 'number', description: 'How many people can win. Default 1 ("first person only").' },
         amountInWeiPerRecipient: { type: 'string', description: 'Amount in wei per winner.' },
         tokenContract: { type: 'string', description: 'Token contract address.' },
-        chainId: { type: 'number', description: 'Chain ID. Base = 8453 (default).' },
+        chainId: { type: 'number', description: `Chain ID. Default: ${DEFAULT_CHAIN_INFO.name} (${DEFAULT_CHAIN_ID}).` },
       },
       required: ['triggerPhrase', 'amountInWeiPerRecipient', 'tokenContract'],
     },
@@ -1463,7 +1471,6 @@ function sanitizeUnverifiedTxClaims(text, realUrls) {
 // ─── Who pays (Labr) ─────────────────────────────────────────────────────────
 // The wallet that pays is decided by the key, and the bot writes it out itself.
 // A model left to describe it named the wrong wallet and invented an address.
-const SOLANA_CHAIN_ID = 1399811149;
 // Fallback names only. loadChainNames() replaces them with Connect's own list
 // at startup, so a chain Connect adds later (Arc was missing here once) is
 // named correctly in "Paying from" lines and #payouts without a code change.
@@ -1499,7 +1506,7 @@ function formatUnits(wei, decimals) {
 // Returns { label, line, problem }. Never throws: a balance read that fails
 // leaves the send to Connect, which refuses it itself if the money isn't there.
 async function dropSource(input, apiKey, senderApiKey, senderUser) {
-  const chainId = Number(input?.chainId ?? 8453);
+  const chainId = Number(input?.chainId ?? DEFAULT_CHAIN_ID);
   const chain = CHAIN_NAMES[chainId] ?? `chain ${chainId}`;
   let bal;
   try { bal = JSON.parse(await mcpCallTool('connect_drop_balance', { chainId }, apiKey)); } catch { return { label: null, line: null, problem: null }; }
@@ -1633,7 +1640,7 @@ function recordSend(senderId, usd) {
 // limit applies, because a guess would either block or wave through at random.
 async function capCheck(senderId, input, src) {
   try {
-    const price = await tokenUsd(Number(input?.chainId ?? 8453), input?.tokenContract, src?.symbol);
+    const price = await tokenUsd(Number(input?.chainId ?? DEFAULT_CHAIN_ID), input?.tokenContract, src?.symbol);
     if (price == null || src?.decimals == null) return { usd: null, over: null };
     const n = Math.max(1, Array.isArray(input?.recipients) ? input.recipients.length : 1);
     const usd = Number(formatUnits(BigInt(input.amountInWeiPerRecipient) * BigInt(n), src.decimals)) * price;
@@ -1659,7 +1666,7 @@ const WALLET_RULES = `
 - Say "paid task", "reward" or "payout", never "bounty" or "airdrop".
 - Never mention anyone's balance in a server channel unless they asked for their balance. Check it with tools as needed, but don't say it (no "You have ~5.8 USDC"). In a DM it's fine.`;
 function systemPrompt() {
-  return SYSTEM_PROMPT + WALLET_RULES + walletFacts;
+  return SYSTEM_PROMPT + WALLET_RULES + walletFacts + defaultChainPrompt(DEFAULT_CHAIN_INFO);
 }
 async function loadWalletFacts(botUserId) {
   if (!QUIDLI_API_KEY) return;
@@ -1684,7 +1691,7 @@ function postPayoutLog({ src, input, senderId, explorerUrl, transferHash, via = 
     const rs = (input?.recipients ?? []).map((r) => r.type === 'discord' && r.id ? `<@${r.id}>` : `${r.type}:${r.username ?? r.id}`);
     let each = '';
     try { if (src?.decimals != null && src?.symbol) each = `${formatUnits(BigInt(input.amountInWeiPerRecipient), src.decimals)} ${src.symbol}`; } catch {}
-    const chain = src?.chain ?? CHAIN_NAMES[Number(input?.chainId ?? 8453)] ?? `chain ${input?.chainId}`;
+    const chain = src?.chain ?? CHAIN_NAMES[Number(input?.chainId ?? DEFAULT_CHAIN_ID)] ?? `chain ${input?.chainId}`;
     const from = src?.who && src?.addr ? `\n-# from ${src.who} \`${src.addr}\`` : '';
     ch.send({
       content: `💸 <@${senderId}> paid ${rs.join(', ') || 'someone'}${each ? ` ${each}${rs.length > 1 ? ' each' : ''}` : ''} on ${chain}${via ? ` (${via})` : ''}${from}\n${explorerUrl ?? `tx \`${transferHash}\``}`,
@@ -1889,7 +1896,7 @@ async function runTool(name, input, {
       if (name === 'connect_drop') {
         let body;
         try { body = JSON.parse(mcpOut); } catch { return mcpOut; }
-        const explorerUrl = explorerTxUrl(input?.chainId ?? 8453, body?.transferHash);
+        const explorerUrl = explorerTxUrl(input?.chainId ?? DEFAULT_CHAIN_ID, body?.transferHash);
         if (explorerUrl) _pendingExplorerUrls.push(explorerUrl);
         console.log('[drop] result:', JSON.stringify(body));
         if (body?.transferHash && src?.line) {
@@ -2099,7 +2106,7 @@ async function runTool(name, input, {
       return JSON.stringify({ error: 'No Quidli API key connected. Sent a DM with setup instructions.' });
     }
     const watcherId = crypto.randomUUID();
-    const dropInput = { amountInWeiPerRecipient: input.amountInWeiPerRecipient, tokenContract: input.tokenContract, chainId: input.chainId ?? 8453 };
+    const dropInput = { amountInWeiPerRecipient: input.amountInWeiPerRecipient, tokenContract: input.tokenContract, chainId: input.chainId ?? DEFAULT_CHAIN_ID };
     db.prepare('INSERT INTO watchers (id, sender_id, channel_id, trigger_phrase, drop_input, max_winners) VALUES (?, ?, ?, ?, ?, ?)')
       .run(watcherId, senderId, input.channelId ?? currentChannelId, input.triggerPhrase, JSON.stringify(dropInput), input.maxWinners ?? 1);
     return JSON.stringify({ success: true, watcherId, message: `Watching for "${input.triggerPhrase}" in this channel. First person to type it gets the drop.` });
