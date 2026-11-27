@@ -25,7 +25,7 @@ said the treasury "funds bounties".
 | Wallet facts | The bot reads its wallets at startup and answers "what's your wallet" with the treasury only. No balances in public lines. |
 | Names | Plain-text @names are looked up among server members. |
 | Wording | Treasury "funds paid tasks". The bot never says "bounty" or "airdrop". |
-| Chains | Chain names in bot-written lines come from Connect at startup, with a built-in fallback. `DEFAULT_CHAIN=base` (default, gas sponsored) or `solana` sets the chain for sends that name none; setup asks. |
+| Chains | Chain names in bot-written lines come from Connect at startup, with a built-in fallback. `DEFAULT_CHAIN` sets the chain for sends that name none: any chain Connect sends on, by name or ID (Base by default, the only one with sponsored gas). Setup asks, lists the chains Connect supports and warns when the wallet has no gas there. USDC addresses for the prompt are verified onchain; where none is, the bot asks for the token address. |
 | Prompt | `SYSTEM_PROMPT_FILE=labr-prompt.txt`: the prompt lives in this repo, not inline in `.env`. |
 | Payout approval | `!confirm` by default. World ID is opt-in with `PAYOUT_APPROVAL=world_id`. |
 | No Minds | The Minds (Animoca Brands) provider is removed: no `!minds` commands, no "switch to minds", no `@animocabrands/minds-client-lib` dependency. The unused `minds_*` columns stay in `users.db`. |

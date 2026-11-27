@@ -26,7 +26,7 @@ const quiet = { log() {}, warn() {}, error() {} };
 test('chain names come from Connect: a new chain is named, testnets are skipped, the fallback stays for the rest', async () => {
   const CHAIN_NAMES = { 8453: 'Base', 42161: 'Arbitrum' };
   const { loadChainNames } = build(['loadChainNames'], {
-    CHAIN_NAMES, QUIDLI_API_KEY: 'k', console: quiet,
+    CHAIN_NAMES, QUIDLI_API_KEY: 'k', console: quiet, DEFAULT_CHAIN_INFO: {}, defaultChainWarning: () => null,
     mcpCallTool: async (name) => {
       assert.equal(name, 'connect_get_chains');
       return JSON.stringify({ chains: [

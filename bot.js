@@ -39,7 +39,7 @@ import { appendFileSync, readFileSync } from 'node:fs';
 import { createMcpRegistry, MCP_CONFIRM_TOOLS, formatToolRecord } from './connect-mcp.js';
 import { createShutdown } from './shutdown.js';
 import { createSecretBox } from './secrets.js';
-import { parseDefaultChain, defaultChainPrompt, SOLANA_CHAIN_ID } from './default-chain.js';
+import { parseDefaultChain, defaultChainPrompt, defaultChainWarning, SOLANA_CHAIN_ID } from './default-chain.js';
 import { createRepeatGuard, repeatNote } from './repeat-guard.js';
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -1486,6 +1486,8 @@ async function loadChainNames() {
     n++;
   }
   console.log(`   Chains: ${n} from Connect`);
+  const chainWarn = defaultChainWarning(DEFAULT_CHAIN_INFO, out?.chains);
+  if (chainWarn) console.warn(`⚠️  ${chainWarn}`);
 }
 
 function isBotRecipient(r, botId) {

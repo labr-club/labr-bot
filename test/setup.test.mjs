@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   INTENTS, missingIntents, inviteUrl, BOT_PERMISSIONS, looksUnset, parseEnv, renderEnv,
-  checkDiscord, enableIntents, checkAnthropic, checkConnect, botGuilds,
+  checkDiscord, enableIntents, checkAnthropic, checkConnect, botGuilds, chainChoices,
 } from '../scripts/setup.mjs';
 
 const all = INTENTS.reduce((m, i) => m | i.limited, 0);
@@ -195,4 +195,23 @@ test('Solana as the default chain: setup reads the Solana wallet and warns when 
 
 test('DEFAULT_CHAIN is written to .env', () => {
   assert.match(renderEnv({ DEFAULT_CHAIN: 'solana' }), /DEFAULT_CHAIN=solana/);
+});
+
+test('setup offers the chains Connect sends on, Base first; gas warning on any unsponsored chain', async () => {
+  const { CHAINS } = await import('../default-chain.js');
+  const reply = (status, body) => ({ status, ok: status < 400, json: async () => body });
+  const tool = (data) => async () => reply(200, { result: { content: [{ type: 'text', text: JSON.stringify(data) }] } });
+  const choices = await chainChoices('k', tool({ chains: [{ chainId: 137, features: { drop: true } }, { chainId: 8453, features: { drop: true } }, { chainId: 4801, isTestnet: true }, { chainId: 42220, features: { drop: false } }] }));
+  assert.deepEqual(choices.map((c) => c.slug), ['base', 'polygon']);
+  const offline = await chainChoices('k', async () => reply(500, {}));
+  assert.equal(offline[0].slug, 'base');
+  assert.equal(offline.length, Object.keys(CHAINS).length, 'Connect down: offer every known chain');
+
+  const wallet = (wei) => async (url, init) => {
+    const { params } = JSON.parse(init.body);
+    return tool(params.name === 'connect_me' ? { profile: { username: 'ana' } } : { walletAddress: '0xw', assets: [{ type: 'native', balanceInWei: wei }] })();
+  };
+  assert.equal((await checkConnect('k', wallet('0'), CHAINS.polygon)).lowGas, true);
+  assert.equal((await checkConnect('k', wallet('5'), CHAINS.polygon)).lowGas, false);
+  assert.equal((await checkConnect('k', wallet('0'), CHAINS.base)).lowGas, false, 'Base gas is sponsored');
 });
