@@ -51,3 +51,8 @@ test('bot.js holds a repeat, releases it when held for another reason or refused
   assert.match(bot, /if \(body\?\.transferHash\) repeatGuard\.mark/);
   assert.match(readFileSync(new URL('../held-actions.js', import.meta.url), 'utf8'), /repeat: 'you just sent this same payment'/);
 });
+
+test('a bare !confirm / !cancel acts on the only waiting transfer; with several it lists them', () => {
+  const bot = readFileSync(new URL('../bot.js', import.meta.url), 'utf8');
+  assert.match(bot, /if \(mine\.length === 1\) code = mine\[0\]\.code;/);
+});
