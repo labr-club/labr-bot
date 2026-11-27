@@ -919,8 +919,18 @@ test('the same payment twice in a row: the second waits for !confirm, a differen
   const notices = [];
   const again = JSON.parse(await runTool('connect_drop', drop, { senderId: 'u1', senderApiKey: 'k', heldNotices: notices }));
   assert.equal(again.status, 'held_for_confirmation');
-  assert.match(notices.join('\n'), /same payment .*ago.*!confirm/);
+  assert.match(notices.join('\n'), /you just sent this same payment[\s\S]*!confirm [A-Z0-9]{6}/);
+  assert.doesNotMatch(notices.join('\n'), /`!confirm` to pay/, 'only the line with the code tells you how to confirm');
   assert.equal(calls.length, 1, 'paid once');
   await runTool('connect_drop', { ...drop, amountInWeiPerRecipient: '3000000' }, { senderId: 'u1', senderApiKey: 'k' });
   assert.equal(calls.length, 2);
+});
+
+test('held sends show USDC on every verified chain, including Solana, and native amounts', async () => {
+  const { formatAmount } = await import('../held-actions.js');
+  assert.equal(formatAmount('10000', 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', 1399811149), '0.01 USDC');
+  assert.equal(formatAmount('1500000', '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359', 137), '1.5 USDC');
+  assert.equal(formatAmount('5000000', null, 1399811149), '0.005 SOL');
+  assert.equal(formatAmount('1000000000000000', undefined, 8453), '0.001 ETH');
+  assert.match(formatAmount('5', null, 5042), /base units of the native token/);
 });

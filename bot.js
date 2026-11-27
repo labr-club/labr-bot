@@ -40,7 +40,7 @@ import { createMcpRegistry, MCP_CONFIRM_TOOLS, formatToolRecord } from './connec
 import { createShutdown } from './shutdown.js';
 import { createSecretBox } from './secrets.js';
 import { parseDefaultChain, defaultChainPrompt, defaultChainWarning, SOLANA_CHAIN_ID } from './default-chain.js';
-import { createRepeatGuard, repeatNote } from './repeat-guard.js';
+import { createRepeatGuard } from './repeat-guard.js';
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -1779,7 +1779,7 @@ async function runTool(name, input, {
     // count as sent until it's confirmed.
     if (name === 'connect_drop' && !checkHold) {
       const ago = repeatGuard.claim(senderId, input);
-      if (ago != null) { checkHold = 'repeat'; checkNotes.push(repeatNote(ago, '!')); }
+      if (ago != null) checkHold = 'repeat';
       else repeatClaimed = true;
     }
   }
