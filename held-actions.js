@@ -347,6 +347,7 @@ const HOLD_REASONS = {
   ungrounded: "it pays someone, or an amount, that isn't in your message",
   cap: "it's over the per-send or daily limit",
   self: 'it pays you, not someone else',
+  repeat: 'you just sent this same payment',
 };
 
 /** Map a user's reply to a guard value, or null if it isn't one. */

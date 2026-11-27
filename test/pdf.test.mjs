@@ -9,6 +9,7 @@
  * mcp.test.mjs.
  */
 import { test } from 'node:test';
+import { createRepeatGuard, repeatNote } from '../repeat-guard.js';
 import assert from 'node:assert/strict';
 import { MCP_SEND_TOOLS, formatToolRecord } from '../connect-mcp.js';
 import { readFileSync } from 'node:fs';
@@ -210,6 +211,8 @@ function buildRunTool(overrides = {}) {
     dropSource: async () => ({ label: 'test wallet on Base', line: '-# Paying from test wallet on Base', problem: null, chain: 'Base', symbol: 'USDC', decimals: 6, addr: '0xfeed', who: 'test wallet' }),
     dropGroundCheck: () => [],
     capCheck: async () => ({ usd: 1, over: null }),
+    repeatGuard: createRepeatGuard(),
+    repeatNote,
     recordSend: () => {},
     postPayoutLog: (x) => logs.push({ senderId: x?.senderId, transferHash: x?.transferHash, via: x?.via ?? null }),
     getUserBankrKey: () => null,
@@ -684,7 +687,7 @@ test('connect_drop gets a new key on every call, and a 202 is retried with the s
   const first = JSON.parse(await rt('connect_drop', input, { senderId: 'u1', senderApiKey: 'k' }));
   assert.equal(first.transferHash, '0xabc');
   assert.equal(seen[0], seen[1], '202 retry reuses the same key');
-  const second = JSON.parse(await rt('connect_drop', input, { senderId: 'u1', senderApiKey: 'k' }));
+  const second = JSON.parse(await rt('connect_drop', { ...input, amountInWeiPerRecipient: '20000' }, { senderId: 'u1', senderApiKey: 'k' }));
   assert.equal(second.transferHash, '0xdef');
   assert.notEqual(seen[2], seen[0], 'a new call gets a new key, even when the model repeats its own');
   assert.ok(!seen.includes('f47ac10b-58cc-4372-a567-0e02b2c3d479'));
@@ -717,7 +720,7 @@ test('never chose: asked once on the first send, which still runs', async () => 
   const { runTool, calls } = buildRunTool();
   const n1 = [], n2 = [];
   await runTool('connect_drop', drop, { senderId: 'u1', senderApiKey: 'k', heldNotices: n1 });
-  await runTool('connect_drop', drop, { senderId: 'u1', senderApiKey: 'k', heldNotices: n2 });
+  await runTool('connect_drop', { ...drop, amountInWeiPerRecipient: '2000000' }, { senderId: 'u1', senderApiKey: 'k', heldNotices: n2 });
   assert.equal(calls.length, 2);
   assert.match(n1.join('\n'), /!guard replies/);
   assert.doesNotMatch(n2.join('\n'), /!guard/, 'the question is asked once');
@@ -907,4 +910,17 @@ test('payout by default is still owner-only, confirmed or not', async () => {
 test('the payout approval mode is read from PAYOUT_APPROVAL and defaults to confirm', () => {
   assert.match(SRC, /PAYOUT_APPROVAL = 'confirm',/);
   assert.match(SRC, /const PAYOUT_USES_WORLD_ID = String\(PAYOUT_APPROVAL\)\.trim\(\)\.toLowerCase\(\) === 'world_id';/);
+});
+
+test('the same payment twice in a row: the second waits for !confirm, a different one runs', async () => {
+  const { runTool, calls, deps } = buildRunTool();
+  deps.guards.u1 = 'none';
+  await runTool('connect_drop', drop, { senderId: 'u1', senderApiKey: 'k' });
+  const notices = [];
+  const again = JSON.parse(await runTool('connect_drop', drop, { senderId: 'u1', senderApiKey: 'k', heldNotices: notices }));
+  assert.equal(again.status, 'held_for_confirmation');
+  assert.match(notices.join('\n'), /same payment .*ago.*!confirm/);
+  assert.equal(calls.length, 1, 'paid once');
+  await runTool('connect_drop', { ...drop, amountInWeiPerRecipient: '3000000' }, { senderId: 'u1', senderApiKey: 'k' });
+  assert.equal(calls.length, 2);
 });

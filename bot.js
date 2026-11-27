@@ -40,6 +40,7 @@ import { createMcpRegistry, MCP_CONFIRM_TOOLS, formatToolRecord } from './connec
 import { createShutdown } from './shutdown.js';
 import { createSecretBox } from './secrets.js';
 import { parseDefaultChain, defaultChainPrompt, SOLANA_CHAIN_ID } from './default-chain.js';
+import { createRepeatGuard, repeatNote } from './repeat-guard.js';
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -1630,6 +1631,7 @@ async function tokenUsd(chainId, tokenContract, symbol) {
     clearTimeout(timer);
   }
 }
+const repeatGuard = createRepeatGuard();
 function usdSentToday(senderId) {
   return db.prepare('SELECT COALESCE(SUM(usd), 0) AS t FROM send_log WHERE sender_id = ? AND at > unixepoch() - 86400').get(String(senderId))?.t ?? 0;
 }
@@ -1751,6 +1753,7 @@ async function runTool(name, input, {
   // that send waits for !confirm. The bot writes why; the model can't.
   let preSrc = null;
   let checkHold = null;
+  let repeatClaimed = false;
   const checkNotes = [];
   const isOwnerHere = BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID);
   const dropKey = senderApiKey || (isOwnerHere ? OWNER_HOST_KEY : null);
@@ -1770,11 +1773,19 @@ async function runTool(name, input, {
     const cap = await capCheck(senderId, input, preSrc);
     preSrc.usd = cap.usd;
     if (cap.over) { checkHold = checkHold ?? 'cap'; checkNotes.push(`-# ${cap.over}`); }
+    // Claimed last, and only if nothing else holds it, so a held send doesn't
+    // count as sent until it's confirmed.
+    if (name === 'connect_drop' && !checkHold) {
+      const ago = repeatGuard.claim(senderId, input);
+      if (ago != null) { checkHold = 'repeat'; checkNotes.push(repeatNote(ago, '!')); }
+      else repeatClaimed = true;
+    }
   }
   const holdWhy = SELF_HELD.has(name) ? null
     : holdReason({ tool: name, confirmed, documentInContext, quotesOther, guard })
       ?? (ALWAYS_HELD.has(name) && MONEY_TOOLS.has(name) && !confirmed ? 'document' : null)
       ?? checkHold;
+  if (holdWhy && repeatClaimed) { repeatGuard.release(senderId, input); repeatClaimed = false; }
   if (holdWhy) {
     const isOwner = BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID);
     const hasKey = name === 'bankr_agent' ? !!getUserBankrKey(senderId)
@@ -1879,7 +1890,7 @@ async function runTool(name, input, {
       if (name === 'connect_drop') {
         if (!keyToUse) return 'Error: this needs your own Quidli key. Tell the user, in your own words: get a key at connect.quid.li, then DM me `!connect <your-key>` to link it. Labr pays from your own Connect wallet.';
         src = preSrc ?? await dropSource(input, keyToUse, senderApiKey, senderUser);
-        if (src.problem) { heldNotices?.push(src.problem); return JSON.stringify({ status: 'refused', executed: false, error: src.problem + ' The bot already posted this; do not restate the wallet address.' }); }
+        if (src.problem) { if (repeatClaimed) repeatGuard.release(senderId, input); heldNotices?.push(src.problem); return JSON.stringify({ status: 'refused', executed: false, error: src.problem + ' The bot already posted this; do not restate the wallet address.' }); }
       }
       const callInput = name === 'connect_drop' ? { ...input, idempotencyKey: crypto.randomUUID() } : input;
       let mcpOut = await mcpCallTool(name, callInput, keyToUse);
@@ -1899,6 +1910,11 @@ async function runTool(name, input, {
         const explorerUrl = explorerTxUrl(input?.chainId ?? DEFAULT_CHAIN_ID, body?.transferHash);
         if (explorerUrl) _pendingExplorerUrls.push(explorerUrl);
         console.log('[drop] result:', JSON.stringify(body));
+        // Sent: a copy in the next couple of minutes waits for !confirm. Clearly
+        // refused: nothing moved, so a retry isn't a repeat. Anything unclear
+        // keeps the claim, since it may still have gone through.
+        if (body?.transferHash) repeatGuard.mark(senderId, input);
+        else if (repeatClaimed && Number(body?.httpStatus) >= 400) repeatGuard.release(senderId, input);
         if (body?.transferHash && src?.line) {
           heldNotices?.push(src.line.replace('Paying from', 'Paid from'));
           recordSend(senderId, src.usd ?? (await capCheck(senderId, input, src)).usd);
